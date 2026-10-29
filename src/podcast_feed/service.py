@@ -13,7 +13,8 @@ make atomic on its own is guarded by two locks here:
 
 Errors are PodcastErrors whose message is shown as it is, in the admin UI and to the MCP
 client. So the database's own NotFound ("There is no feed ...") never gets out: it is turned
-into the messages below. `settings.public_base` is a secret and appears only in `feed_url`.
+into the messages below. `settings.public_base` is a secret and appears only in `feed_url`
+and in the addresses inside `feed_document`'s feed, which is served to those who know it.
 """
 
 import os
@@ -22,11 +23,14 @@ import threading
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
+from datetime import datetime
+from pathlib import Path
 
 from podcast_feed.config import MAX_RETENTION_DAYS, Settings
 from podcast_feed.db import Database, Episode, Feed
 from podcast_feed.errors import Invalid, NotFound
 from podcast_feed.guard import check_url
+from podcast_feed.rss import render_feed
 from podcast_feed.slug import slugify, valid_slug
 from podcast_feed.storage import Storage
 
@@ -47,6 +51,7 @@ MAX_ARTWORK_BYTES = 5 * 1024 * 1024
 # What a PNG and a JPEG start with, and the extension the cover gets.
 _ARTWORK_MAGIC = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpg"))
 _ARTWORK_EXTENSIONS = ("png", "jpg")
+_ARTWORK_TYPES = {"png": "image/png", "jpg": "image/jpeg"}
 
 
 @dataclass(frozen=True)
@@ -64,6 +69,10 @@ def _unknown_feed(slug: str) -> NotFound:
 
 def _no_episode(id: str) -> NotFound:
     return NotFound(f"No episode '{id}'.")
+
+
+def _artwork_type(name: str) -> str:
+    return _ARTWORK_TYPES.get(name.rpartition(".")[2], "application/octet-stream")
 
 
 @contextmanager
@@ -304,6 +313,32 @@ class Service:
         self._storage.delete_episode_files(episode.feed_slug, episode)
         self._storage.delete_episode_files_by_id(episode.feed_slug, episode.id)
 
+    # ---------------------------------------------------------------- public files
+
+    def feed_document(self, slug: str) -> tuple[bytes, datetime]:
+        """The feed's RSS and when the feed last changed (for Last-Modified): its ready
+        episodes whose audio file is still on disk, newest published first. NotFound for an
+        unknown feed.
+        """
+        feed = self.get_feed(slug)
+        ready = self._db.list_episodes(feed_id=feed.id, status="ready", limit=None)
+        present = [e for e in ready if e.file is not None and self._file_exists(slug, e.file)]
+        return render_feed(feed, present, self._settings.public_base), feed.changed_at
+
+    def media_file(self, slug: str, name: str) -> tuple[Path, str]:
+        """The file served at /media/<slug>/<name> and its MIME type.
+
+        Only what a feed shows is public: a ready episode's audio and artwork, and the feed's
+        cover. The names come from the database, never from the folder, so anything else
+        (another feed's file, an episode that is not ready, a half-written upload, a made-up
+        name) is NotFound, and so is a file that has gone from the disk.
+        """
+        feed = self.get_feed(slug)
+        mime = self._public_type(feed, name)
+        if mime is None or not self._file_exists(slug, name):
+            raise NotFound("No such file.")
+        return self._storage.path(slug, name), mime
+
     # ---------------------------------------------------------------------- helpers
 
     def _feed_for_add(self, slug: str | None) -> Feed:
@@ -325,3 +360,23 @@ class Service:
             self._db.requeue(id)
             # requeue ignores a missing episode, and the sweep may just have deleted this one.
             return self.get_episode(id), True
+
+    def _public_type(self, feed: Feed, name: str) -> str | None:
+        """The MIME type of `name` if it is a public file of the feed, else None."""
+        if name == feed.artwork:
+            return _artwork_type(name)
+        # An episode's files are called <episode id>.<extension>, and an id has no dot.
+        episode = self._db.get_episode(name.partition(".")[0])
+        if episode is None or episode.feed_id != feed.id or episode.status != "ready":
+            return None
+        if name == episode.file:
+            return episode.mime or "application/octet-stream"
+        if name == episode.artwork:
+            return _artwork_type(name)
+        return None
+
+    def _file_exists(self, slug: str, name: str) -> bool:
+        try:
+            return self._storage.exists(slug, name)
+        except Invalid:  # not a plain file name
+            return False

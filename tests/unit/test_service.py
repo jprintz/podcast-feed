@@ -2,6 +2,7 @@ import asyncio
 import dataclasses
 import threading
 import time
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor
 
 import pytest
@@ -850,3 +851,160 @@ def test_wake_is_only_for_queued_episodes(svc, db, wakes):
     svc.remove_episode(ep.id)
     svc.delete_feed("talks")
     assert len(wakes) == 1
+
+
+# ------------------------------------------------------ what the public routes serve
+
+
+def guids(body: bytes) -> list[str | None]:
+    return [g.text for g in ET.fromstring(body).iterfind("channel/item/guid")]
+
+
+def test_feed_document(svc, db, storage):
+    svc.create_feed("Talks", description="About")
+    ready = publish(db, storage, svc.add_episode(URL))
+    svc.add_episode("https://x.example/b.mp3")  # still queued: not in the feed
+    body, changed = svc.feed_document("talks")
+    assert guids(body) == [ready.id]
+    assert changed == svc.get_feed("talks").changed_at
+    xml = ET.fromstring(body)
+    assert xml.findtext("channel/description") == "About"
+    assert xml.findtext("channel/link") == "https://podcast-api.example.com/s3cr3t/feeds/talks.xml"
+    enclosure = xml.find("channel/item/enclosure")
+    assert enclosure is not None
+    assert (
+        enclosure.get("url") == f"https://podcast-api.example.com/s3cr3t/media/talks/{ready.id}.mp3"
+    )
+
+
+def test_feed_document_of_a_feed_without_episodes(svc):
+    svc.create_feed("Talks")
+    body, _ = svc.feed_document("talks")
+    assert guids(body) == []
+
+
+def test_feed_document_lists_every_ready_episode(svc, db, storage):
+    svc.create_feed("Talks")
+    made = [publish(db, storage, svc.add_episode(f"https://x.example/{n}.mp3")) for n in range(55)]
+    body, _ = svc.feed_document("talks")
+    assert sorted(guids(body)) == sorted(e.id for e in made)  # not just the first 50
+
+
+def test_feed_document_skips_an_episode_whose_file_is_gone(svc, db, storage):
+    svc.create_feed("Talks")
+    kept = publish(db, storage, svc.add_episode(URL))
+    gone = publish(db, storage, svc.add_episode("https://x.example/b.mp3"))
+    (storage.feed_dir("talks") / f"{gone.id}.mp3").unlink()
+    body, _ = svc.feed_document("talks")
+    assert guids(body) == [kept.id]
+
+
+def test_feed_document_only_has_the_episodes_of_its_feed(svc, db, storage):
+    svc.create_feed("Talks")
+    svc.create_feed("B")
+    mine = publish(db, storage, svc.add_episode(URL, feed="talks"))
+    publish(db, storage, svc.add_episode(URL, feed="b"))
+    assert guids(svc.feed_document("talks")[0]) == [mine.id]
+
+
+def test_feed_document_follows_the_feed(svc, db, storage):
+    svc.create_feed("Talks")
+    first, changed = svc.feed_document("talks")
+    publish(db, storage, svc.add_episode(URL))
+    second, changed_again = svc.feed_document("talks")
+    assert first != second and changed_again >= changed
+    assert changed_again == svc.get_feed("talks").changed_at
+
+
+def test_feed_document_of_an_unknown_feed(svc):
+    with pytest.raises(NotFound) as exc:
+        svc.feed_document("nope")
+    assert str(exc.value) == "Unknown feed 'nope'. Call list_feeds for the slugs."
+
+
+def test_media_file_allowlist(svc, db, storage):
+    svc.create_feed("Talks")
+    svc.set_feed_artwork("talks", PNG)
+    ep = publish(db, storage, svc.add_episode(URL), artwork=True)
+    folder = storage.feed_dir("talks")
+    # A ready episode's audio and artwork, and the cover, resolve:
+    assert svc.media_file("talks", f"{ep.id}.mp3") == (folder / f"{ep.id}.mp3", "audio/mpeg")
+    assert svc.media_file("talks", f"{ep.id}.png") == (folder / f"{ep.id}.png", "image/png")
+    assert svc.media_file("talks", "cover.png") == (folder / "cover.png", "image/png")
+
+    # Everything else does not, whether or not it is in the folder:
+    queued = svc.add_episode("https://x.example/q.mp3")
+    for stray in (".cover.upload", "notes.txt", f"{queued.id}.mp3", f"{ep.id}.jpg"):
+        (folder / stray).write_bytes(b"x")
+    other = svc.create_feed("B")
+    foreign = publish(db, storage, svc.add_episode(URL, feed="b"))
+    (folder / f"{foreign.id}.mp3").write_bytes(b"x")  # another feed's id, in this folder
+    for name in (
+        "nope.mp3",
+        "cover.jpg",
+        ".cover.upload",
+        "notes.txt",
+        f"{queued.id}.mp3",  # not ready
+        f"{ep.id}.jpg",  # not what the row names
+        f"{ep.id}.mp3.bak",
+        f"{ep.id}.",
+        f"{foreign.id}.mp3",  # belongs to feed b
+        f"../{other.slug}/{foreign.id}.mp3",
+        "../talks/cover.png",
+        "..",
+        ".",
+        "",
+        "/etc/passwd",
+        "a\x00b",
+    ):
+        with pytest.raises(NotFound):
+            svc.media_file("talks", name)
+    with pytest.raises(NotFound):
+        svc.media_file("nope", f"{ep.id}.mp3")
+    with pytest.raises(NotFound):
+        svc.media_file("../media/talks", f"{ep.id}.mp3")
+    assert svc.media_file("b", f"{foreign.id}.mp3")[1] == "audio/mpeg"
+
+
+def test_media_file_types(svc, db, storage):
+    svc.create_feed("Talks")
+    svc.set_feed_artwork("talks", JPEG)
+    ep = svc.add_episode(URL)
+    folder = storage.feed_dir("talks")
+    (folder / f"{ep.id}.m4a").write_bytes(b"audio")
+    (folder / f"{ep.id}.jpg").write_bytes(b"art")
+    db.mark_ready(
+        ep.id,
+        title="T",
+        description=None,
+        artwork=f"{ep.id}.jpg",
+        file=f"{ep.id}.m4a",
+        mime="audio/mp4",
+        size_bytes=5,
+        duration_s=None,
+    )
+    assert svc.media_file("talks", f"{ep.id}.m4a")[1] == "audio/mp4"
+    assert svc.media_file("talks", f"{ep.id}.jpg")[1] == "image/jpeg"
+    assert svc.media_file("talks", "cover.jpg")[1] == "image/jpeg"
+    with pytest.raises(NotFound):
+        svc.media_file("talks", "cover.png")  # the cover is a JPEG now
+
+
+def test_media_file_of_a_file_that_is_gone(svc, db, storage):
+    svc.create_feed("Talks")
+    svc.set_feed_artwork("talks", PNG)
+    ep = publish(db, storage, svc.add_episode(URL), artwork=True)
+    folder = storage.feed_dir("talks")
+    for name in (f"{ep.id}.mp3", f"{ep.id}.png", "cover.png"):
+        assert svc.media_file("talks", name)[0] == folder / name
+        (folder / name).unlink()
+        with pytest.raises(NotFound):
+            svc.media_file("talks", name)
+
+
+def test_the_public_methods_never_leak_the_secret_in_errors(svc):
+    svc.create_feed("Talks")
+    for call in (lambda: svc.feed_document("nope"), lambda: svc.media_file("talks", "nope.mp3")):
+        with pytest.raises(NotFound) as exc:
+            call()
+        assert "s3cr3t" not in str(exc.value)

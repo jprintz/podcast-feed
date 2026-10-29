@@ -5,9 +5,10 @@ file stays as it is, AAC is copied into an .m4a, and anything else is transcoded
 128 kbps in an .m4a; `convert` does that; `extract_cover` pulls out embedded cover art.
 
 Every path handed to ffmpeg or ffprobe is made absolute first, so a file name that starts with
-`-` can never be read as an option, and every input is opened with the `file` protocol only, so
-a downloaded playlist cannot make ffmpeg fetch other URLs (the URL guard only sees our own
-download).
+`-` can never be read as an option. Every input is opened with the `file` protocol only, so
+ffmpeg never fetches a URL itself (the URL guard only sees our own download). Playlist formats
+(HLS, concat, DASH, SDP) are refused outright by `probe`: they name other files, and ffmpeg
+would read local ones, so the format check is what blocks local references.
 """
 
 import asyncio
@@ -30,6 +31,8 @@ COVER_TIMEOUT_S = 120
 AUDIO_BITRATE = "128k"
 
 _LOCAL_FILES_ONLY = ["-protocol_whitelist", "file"]
+# Formats whose files are lists of other files or streams; `format_name` can list several.
+_PLAYLIST_FORMATS = {"hls", "applehttp", "concat", "dash", "sdp"}
 _COVER_EXTENSIONS = {"mjpeg": ".jpg", "png": ".png"}
 
 OutputPlan = Literal["keep", "copy", "transcode"]
@@ -38,13 +41,15 @@ OutputPlan = Literal["keep", "copy", "transcode"]
 @dataclass(frozen=True)
 class Probe:
     """What ffprobe found. `tags` has lower-cased keys, from the format and the first audio
-    stream (the format's win). `cover_codec` is the codec of the attached picture, if any."""
+    stream (the format's win). `cover_codec` is the codec of the attached picture, if any, and
+    `cover_index` its stream index in the file."""
 
     format_name: str
     duration_s: float | None
     audio_codec: str | None
     cover_codec: str | None
     tags: dict[str, str]
+    cover_index: int | None = None
 
 
 def _arg(path: Path) -> str:
@@ -97,6 +102,9 @@ async def probe(path: Path) -> Probe:
 
     streams = [s for s in info["streams"] if isinstance(s, dict)]
     fmt = info.get("format") or {}
+    format_name = str(fmt.get("format_name") or "")
+    if _PLAYLIST_FORMATS.intersection(format_name.split(",")):
+        raise EpisodeFailure(NOT_MEDIA)
     audio = next((s for s in streams if s.get("codec_type") == "audio"), None)
     if audio is None:
         raise EpisodeFailure("no audio stream")
@@ -115,11 +123,12 @@ async def probe(path: Path) -> Probe:
         for key, value in (source or {}).items()
     }
     return Probe(
-        format_name=str(fmt.get("format_name") or ""),
+        format_name=format_name,
         duration_s=_duration(fmt),
         audio_codec=audio.get("codec_name"),
         cover_codec=cover.get("codec_name") if cover else None,
         tags=tags,
+        cover_index=cover.get("index") if cover else None,
     )
 
 
@@ -164,14 +173,16 @@ async def convert(
 async def extract_cover(src: Path, dest_stem: Path, p: Probe) -> Path | None:
     """Save the cover art embedded in src as <dest_stem>.jpg or .png and return that path.
 
-    Returns None if there is no JPEG or PNG cover or it cannot be extracted: art is optional.
+    The picture is mapped by its stream index (p.cover_index): a file can have a real video
+    stream before it. Returns None if there is no JPEG or PNG cover or it cannot be extracted:
+    art is optional.
     """
     extension = _COVER_EXTENSIONS.get(p.cover_codec or "")
-    if extension is None:
+    if extension is None or not isinstance(p.cover_index, int):
         return None
     dest = dest_stem.with_name(dest_stem.name + extension)
     argv = ["ffmpeg", "-nostdin", "-v", "error", "-y", *_LOCAL_FILES_ONLY, "-i", _arg(src)]
-    argv += ["-map", "0:v:0", "-frames:v", "1", "-c:v", "copy", _arg(dest)]
+    argv += ["-map", f"0:{p.cover_index}", "-frames:v", "1", "-c:v", "copy", _arg(dest)]
     done = False
     try:
         code, _ = await _run(argv, COVER_TIMEOUT_S)

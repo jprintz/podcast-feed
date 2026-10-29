@@ -36,11 +36,19 @@ def _ffmpeg(*args: str) -> None:
     )
 
 
+def _picture(tmp_path: Path, name: str) -> Path:
+    """A 64x64 red square; the extension picks PNG or JPEG."""
+    picture = tmp_path / name
+    _ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", str(picture))
+    return picture
+
+
 def make_media(tmp_path: Path, kind: str) -> Path:
     """Write a media file of the given kind into tmp_path and return its path.
 
     Kinds: mp3, mp3_cover (PNG cover), mp3_cover_jpg (JPEG cover), m4a, opus, video (MPEG-4
-    video and AAC audio), video_mp3 (MPEG-4 video and MP3 audio in a .mkv), video_silent (no
+    video and AAC audio), video_cover (the same, then a PNG attached picture as the third
+    stream), video_mp3 (MPEG-4 video and MP3 audio in a .mkv), video_silent (no
     audio stream) and text (not media at all).
     """
     if kind == "text":
@@ -49,10 +57,19 @@ def make_media(tmp_path: Path, kind: str) -> Path:
         return path
     if kind in _COVERED:
         name, picture_name, codec = _COVERED[kind]
-        picture = tmp_path / picture_name
-        _ffmpeg("-f", "lavfi", "-i", "color=c=red:s=64x64", "-frames:v", "1", str(picture))
+        picture = _picture(tmp_path, picture_name)
         path = tmp_path / name
         _ffmpeg(*TONE, "-i", str(picture), *WITH_COVER, *TITLE, *MP3, "-c:v", codec, str(path))
+        return path
+    if kind == "video_cover":
+        # The real video comes first (stream 0), then the audio, then the picture (stream 2).
+        path = tmp_path / "clip_cover.mp4"
+        picture = _picture(tmp_path, "cover.png")
+        _ffmpeg(
+            *PATTERN, *TONE, "-i", str(picture), "-map", "0:v", "-map", "1:a", "-map", "2:v",
+            *TITLE, "-c:v:0", "mpeg4", "-c:a", "aac", "-c:v:1", "png",
+            "-disposition:v:1", "attached_pic", str(path),
+        )  # fmt: skip
         return path
     name, args = _KINDS[kind]
     path = tmp_path / name

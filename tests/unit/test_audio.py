@@ -65,9 +65,13 @@ async def test_probe_missing_file(ffmpeg_tools, tmp_path):
 async def test_probe_reports_the_container_and_the_cover(media):
     plain, covered = await probe(media("mp3")), await probe(media("mp3_cover"))
     assert plain.format_name == covered.format_name == "mp3"
-    assert plain.cover_codec is None and covered.cover_codec == "png"
+    assert plain.cover_codec is None and plain.cover_index is None
+    assert covered.cover_codec == "png" and covered.cover_index == 1  # the stream after the audio
     assert covered.audio_codec == "mp3"
     assert (await probe(media("mp3_cover_jpg"))).cover_codec == "mjpeg"
+    # A real video stream comes first, then the audio, then the picture.
+    video_cover = await probe(media("video_cover"))
+    assert video_cover.cover_codec == "png" and video_cover.cover_index == 2
 
 
 async def test_probe_tags_come_from_the_stream_too_and_are_lower_case(media):
@@ -78,8 +82,11 @@ async def test_probe_tags_come_from_the_stream_too_and_are_lower_case(media):
     assert all(key == key.lower() for key in tags)
 
 
-async def test_probe_does_not_follow_urls_in_a_playlist(ffmpeg_tools, tmp_path, local_http_server):
-    # A downloaded playlist must not make ffmpeg fetch a URL: that would bypass the URL guard.
+async def test_probe_refuses_playlists_that_point_at_urls(
+    ffmpeg_tools, tmp_path, local_http_server
+):
+    # The format check refuses them, and ffmpeg (with `-protocol_whitelist file`) would not
+    # fetch the URL anyway: either way nothing may reach the server, which would bypass the guard.
     url = f"http://127.0.0.1:{local_http_server.port}/segment.ts"
     playlist = tmp_path / "list.m3u8"
     playlist.write_text(f"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:10,\n{url}\n#EXT-X-ENDLIST\n")
@@ -89,6 +96,32 @@ async def test_probe_does_not_follow_urls_in_a_playlist(ffmpeg_tools, tmp_path, 
         with pytest.raises(EpisodeFailure, match=NOT_MEDIA):
             await probe(path)
     assert local_http_server.last_host is None
+
+
+async def test_probe_refuses_playlists_that_point_at_local_files(media, tmp_path):
+    # ffmpeg reads local files named in a playlist, so a downloaded .m3u8 could pull in any file
+    # on the server: the format check must refuse it even though the target is real media.
+    target = media("mp3")
+    hls = tmp_path / "list.m3u8"
+    hls.write_text(f"#EXTM3U\n#EXT-X-TARGETDURATION:10\n#EXTINF:2,\n{target}\n#EXT-X-ENDLIST\n")
+    concat = tmp_path / "list.ffconcat"
+    concat.write_text(f"ffconcat version 1.0\nfile {target.name}\n")  # relative names are allowed
+    for path in (hls, concat):
+        with pytest.raises(EpisodeFailure, match=NOT_MEDIA):
+            await probe(path)
+
+
+@pytest.mark.parametrize(
+    "format_name", ["hls", "applehttp", "concat", "dash", "sdp", "mov,mp4,hls", "dash,concat"]
+)
+async def test_probe_refuses_every_playlist_format(fake_tool, tmp_path, format_name):
+    streams = '[{"codec_type": "audio", "codec_name": "aac", "disposition": {"attached_pic": 0}}]'
+    fake_tool(
+        "ffprobe",
+        f"""printf '%s' '{{"format": {{"format_name": "{format_name}"}}, "streams": {streams}}}'""",
+    )
+    with pytest.raises(EpisodeFailure, match=NOT_MEDIA):
+        await probe(tmp_path / "anything")
 
 
 @pytest.mark.parametrize(
@@ -264,15 +297,30 @@ async def test_extract_cover_writes_a_png_or_a_jpeg_at_the_stem(media, tmp_path)
         assert cover.read_bytes().startswith(magic)
 
 
+async def test_extract_cover_takes_the_picture_not_the_first_video_stream(media, tmp_path):
+    # An mp4 with video, audio and then a PNG attached picture: `-map 0:v:0` would write the
+    # MPEG-4 video stream into the .png.
+    src = media("video_cover")
+    cover = await extract_cover(src, tmp_path / "ep", await probe(src))
+    assert cover == tmp_path / "ep.png"
+    assert cover.read_bytes().startswith(b"\x89PNG")
+
+
 async def test_extract_cover_ignores_other_picture_codecs(tmp_path):
-    p = Probe("mp3", 2.0, "mp3", "gif", {})
+    p = Probe("mp3", 2.0, "mp3", "gif", {}, cover_index=1)
+    assert await extract_cover(tmp_path / "in.mp3", tmp_path / "ep", p) is None
+    assert list(tmp_path.iterdir()) == []
+
+
+async def test_extract_cover_needs_to_know_which_stream(tmp_path):
+    p = Probe("mp3", 2.0, "mp3", "png", {})  # no cover_index
     assert await extract_cover(tmp_path / "in.mp3", tmp_path / "ep", p) is None
     assert list(tmp_path.iterdir()) == []
 
 
 async def test_extract_cover_failure_is_none_and_leaves_nothing(media, tmp_path):
     src = media("mp3")  # has no picture, whatever the probe claims
-    p = dataclasses.replace(await probe(src), cover_codec="png")
+    p = dataclasses.replace(await probe(src), cover_codec="png", cover_index=1)
     assert await extract_cover(src, tmp_path / "ep", p) is None
     assert not (tmp_path / "ep.png").exists()
 

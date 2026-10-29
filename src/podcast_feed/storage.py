@@ -73,6 +73,23 @@ class Storage:
             if name:
                 self.path(slug, name).unlink(missing_ok=True)
 
+    def delete_episode_files_by_id(self, slug: str, episode_id: str) -> None:
+        """Delete every file in the feed's folder named `<episode_id>.<anything>`.
+
+        Unlike delete_episode_files this does not depend on the names a database row holds,
+        so it also takes the files a worker published after the row was read. The name must
+        be the id, a dot, and then anything: another episode's files never match. Folders are
+        left alone. A missing feed folder is fine.
+        """
+        prefix = f"{_plain_name(episode_id)}."
+        try:
+            entries = list(self.feed_dir(slug).iterdir())
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        for entry in entries:
+            if entry.name.startswith(prefix) and not entry.is_dir():
+                entry.unlink(missing_ok=True)
+
     def delete_feed(self, slug: str) -> None:
         """Delete the feed's folder and everything in it, if it exists."""
         folder = self.feed_dir(slug)

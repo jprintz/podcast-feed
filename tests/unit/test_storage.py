@@ -145,6 +145,56 @@ def test_delete_episode_files_refuses_a_path(s):
     assert outside.exists()
 
 
+def test_delete_episode_files_by_id(s):
+    folder = s.feed_dir("talks")
+    folder.mkdir()
+    mine = ["abcdefghijkl.mp3", "abcdefghijkl.m4a", "abcdefghijkl.png", "abcdefghijkl.jpg"]
+    others = [
+        "abcdefghijklm.mp3",  # another episode whose id starts with this id
+        "zbcdefghijkl.mp3",
+        "abcdefghijkl",  # no dot after the id
+        "xabcdefghijkl.mp3",
+        "cover.png",
+    ]
+    for name in mine + others:
+        (folder / name).write_bytes(b"x")
+    (s.root / "other").mkdir()
+    (s.root / "other" / "abcdefghijkl.mp3").write_bytes(b"x")
+    s.delete_episode_files_by_id("talks", "abcdefghijkl")
+    assert sorted(p.name for p in folder.iterdir()) == sorted(others)
+    assert (s.root / "other" / "abcdefghijkl.mp3").exists()
+    s.delete_episode_files_by_id("talks", "abcdefghijkl")  # nothing left: fine
+
+
+def test_delete_episode_files_by_id_keeps_folders(s):
+    folder = s.feed_dir("talks")
+    (folder / "abcdefghijkl.d").mkdir(parents=True)
+    (folder / "abcdefghijkl.d" / "inner").write_bytes(b"x")
+    s.delete_episode_files_by_id("talks", "abcdefghijkl")
+    assert (folder / "abcdefghijkl.d" / "inner").exists()
+
+
+def test_delete_episode_files_by_id_without_a_folder(s):
+    s.delete_episode_files_by_id("gone", "abcdefghijkl")
+    assert not s.feed_dir("gone").exists()
+
+
+@pytest.mark.parametrize("episode_id", ["", ".", "..", ".hidden", "../x", "a/b", "a\\b", "a\0b"])
+def test_delete_episode_files_by_id_refuses_anything_but_a_plain_id(s, episode_id):
+    folder = s.feed_dir("talks")
+    folder.mkdir()
+    (folder / "a.mp3").write_bytes(b"x")
+    (folder / "..mp3").write_bytes(b"x")
+    with pytest.raises(Invalid):
+        s.delete_episode_files_by_id("talks", episode_id)
+    assert sorted(p.name for p in folder.iterdir()) == ["..mp3", "a.mp3"]
+
+
+def test_delete_episode_files_by_id_refuses_a_bad_slug(s):
+    with pytest.raises(Invalid):
+        s.delete_episode_files_by_id("../media", "abcdefghijkl")
+
+
 def test_delete_feed(s):
     folder = s.feed_dir("talks")
     (folder / "sub").mkdir(parents=True)

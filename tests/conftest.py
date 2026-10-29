@@ -1,9 +1,14 @@
 """Shared pytest fixtures. Later tasks add to this file."""
 
 import asyncio
+import os
+import shutil
 from dataclasses import dataclass
+from pathlib import Path
 
 import pytest
+
+from tests.media import make_media
 
 _TLS_HANDSHAKE = 0x16
 
@@ -52,3 +57,25 @@ async def local_http_server():
     seen.port = server.sockets[0].getsockname()[1]
     async with server:
         yield seen
+
+
+@pytest.fixture
+def ffmpeg_tools() -> None:
+    """Skip the test when ffmpeg or ffprobe is missing; CI sets REQUIRE_FFMPEG=1 to fail instead."""
+    missing = [tool for tool in ("ffmpeg", "ffprobe") if shutil.which(tool) is None]
+    if not missing:
+        return
+    reason = f"{' and '.join(missing)} not found on PATH"
+    if os.environ.get("REQUIRE_FFMPEG") == "1":
+        pytest.fail(f"{reason} (REQUIRE_FFMPEG=1)")
+    pytest.skip(reason)
+
+
+@pytest.fixture
+def media(ffmpeg_tools: None, tmp_path: Path):
+    """A factory for tiny media files in tmp_path: `media("mp3")`, see tests/media.py for the kinds."""
+
+    def make(kind: str) -> Path:
+        return make_media(tmp_path, kind)
+
+    return make

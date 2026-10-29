@@ -3,7 +3,7 @@
 import math
 import os
 from collections.abc import Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from urllib.parse import urlsplit
 
@@ -15,8 +15,9 @@ GIB = 1024**3
 @dataclass(frozen=True)
 class Settings:
     # The public origin plus the secret path prefix, no trailing "/". It is a secret:
-    # never log it and never put it in an error message.
-    public_base: str
+    # never log it and never put it in an error message. repr=False keeps it out of
+    # repr(settings), so a debug log or a test diff cannot leak it.
+    public_base: str = field(repr=False)
     data_dir: Path
     media_dir: Path
     retention_days: int
@@ -50,10 +51,16 @@ def _public_base(env: Mapping[str, str]) -> str:
             "PODCAST_PUBLIC_BASE is not set: give podcast-feed the public https:// address "
             "of its feeds, including the secret path"
         )
-    parts = urlsplit(raw)
-    if parts.scheme.lower() != "https" or not parts.hostname:
-        # The value carries a secret, so it is not repeated here.
-        raise ConfigError("PODCAST_PUBLIC_BASE must be an https:// address with a host name")
+    # The value carries a secret, so it is not repeated in the error, and urlsplit's own
+    # ValueError is not chained to it.
+    error = ConfigError("PODCAST_PUBLIC_BASE must be an https:// address with a host name")
+    try:
+        parts = urlsplit(raw)
+        has_host = bool(parts.hostname)
+    except ValueError:
+        raise error from None
+    if parts.scheme.lower() != "https" or not has_host:
+        raise error
     return raw
 
 

@@ -100,3 +100,15 @@ def test_settings_are_frozen():
     s = Settings.from_env(BASE)
     with pytest.raises(AttributeError):
         s.host = "elsewhere"  # type: ignore[misc]
+
+
+def test_settings_repr_does_not_leak_the_public_base():
+    s = Settings.from_env(BASE)
+    assert "s3cr3t" not in repr(s)
+    assert "s3cr3t" not in str(s)
+
+
+def test_unparsable_public_base_is_a_config_error_that_hides_the_value():
+    with pytest.raises(ConfigError, match="https") as caught:
+        Settings.from_env({"PODCAST_PUBLIC_BASE": "https://[abc/s3cr3t"})
+    assert "s3cr3t" not in str(caught.value)

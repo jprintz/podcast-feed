@@ -1,0 +1,24 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": { "enabled": true },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Images of the throwaway Kavita + File Browser (scripts/throwaway.sh) and pandoc in CI",
+      "managerFilePatterns": ["/^scripts/throwaway\\.sh$/", "/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["_IMAGE[=:] ?(?<depName>[a-z0-9./-]+):(?<currentValue>[^\\s\"]+)"],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "description": "epubcheck in CI",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["EPUBCHECK_VERSION: (?<currentValue>[\\d.]+)"],
+      "depNameTemplate": "w3c/epubcheck",
+      "datasourceTemplate": "github-releases",
+      "extractVersionTemplate": "^v(?<version>.*)$"
+    }
+  ]
+}

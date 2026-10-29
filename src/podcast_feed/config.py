@@ -10,6 +10,8 @@ from urllib.parse import urlsplit
 from podcast_feed.errors import ConfigError
 
 GIB = 1024**3
+# Ten years. The retention sweep subtracts it from the clock, which overflows far beyond this.
+MAX_RETENTION_DAYS = 3650
 
 
 @dataclass(frozen=True)
@@ -34,7 +36,9 @@ class Settings:
             public_base=_public_base(env),
             data_dir=Path(_text(env, "PODCAST_DATA_DIR", "/data")),
             media_dir=Path(_text(env, "PODCAST_MEDIA_DIR", "/media")),
-            retention_days=_number(env, "PODCAST_RETENTION_DAYS", 30, int, minimum=1),
+            retention_days=_number(
+                env, "PODCAST_RETENTION_DAYS", 30, int, minimum=1, maximum=MAX_RETENTION_DAYS
+            ),
             max_bytes=_number(env, "PODCAST_MAX_BYTES", GIB, int, minimum=1),
             max_hours=_number(env, "PODCAST_MAX_HOURS", 6.0, float, minimum=0, exclusive=True),
             min_free_bytes=int(_number(env, "PODCAST_MIN_FREE_GB", 5, float, minimum=0) * GIB),

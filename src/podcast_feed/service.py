@@ -23,7 +23,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 
-from podcast_feed.config import Settings
+from podcast_feed.config import MAX_RETENTION_DAYS, Settings
 from podcast_feed.db import Database, Episode, Feed
 from podcast_feed.errors import Invalid, NotFound
 from podcast_feed.guard import check_url
@@ -34,6 +34,7 @@ NO_FEEDS = "No feeds yet: create one in the podcast admin UI first."
 NEEDS_TITLE = "A feed needs a title."
 BAD_SLUG = "Slugs are 1 to 40 lowercase letters, digits and dashes."
 BAD_RETENTION = "Retention must be at least 1 day."
+LONG_RETENTION = f"Retention can be at most {MAX_RETENTION_DAYS} days."
 BAD_ARTWORK = "Artwork must be a PNG or JPEG under 5 MB."
 ONLY_FAILED = "Only failed episodes can be retried."
 BAD_LIMIT = "The limit must be at least 1."
@@ -99,8 +100,11 @@ def _feed_title(title: str) -> str:
 def _retention(days: int | None) -> int | None:
     if days is None:
         return None
-    if not isinstance(days, int) or days < 1:
+    # type() is int, not isinstance: True and False are ints too.
+    if type(days) is not int or days < 1:
         raise Invalid(BAD_RETENTION)
+    if days > MAX_RETENTION_DAYS:
+        raise Invalid(LONG_RETENTION)
     return days
 
 
@@ -263,6 +267,7 @@ class Service:
     ) -> list[Episode]:
         """Episodes, newest first, of one feed (slug) or of all, optionally with one status.
         limit=None returns them all."""
+        status = _clean(status)  # blank means any, like a blank feed
         if status is not None and status not in STATUSES:
             raise Invalid(f"Unknown status '{status}'. Use one of: {', '.join(STATUSES)}.")
         if limit is not None and limit < 1:  # SQLite would read a negative one as "no limit"

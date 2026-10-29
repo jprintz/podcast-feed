@@ -38,6 +38,20 @@ def test_retention_at_least_one_day():
         Settings.from_env({**BASE, "PODCAST_RETENTION_DAYS": "0"})
 
 
+def test_retention_up_to_ten_years():
+    s = Settings.from_env({**BASE, "PODCAST_RETENTION_DAYS": "3650"})
+    assert s.retention_days == 3650
+    assert Settings.from_env({**BASE, "PODCAST_RETENTION_DAYS": "1"}).retention_days == 1
+
+
+@pytest.mark.parametrize("days", ["3651", "1000000", "1" + "0" * 30])
+def test_retention_over_ten_years_is_refused(days):
+    # The retention sweep subtracts it from the clock, which overflows far above this.
+    with pytest.raises(ConfigError, match="PODCAST_RETENTION_DAYS") as caught:
+        Settings.from_env({**BASE, "PODCAST_RETENTION_DAYS": days})
+    assert "s3cr3t" not in str(caught.value)
+
+
 def test_every_setting_can_be_overridden():
     s = Settings.from_env(
         {

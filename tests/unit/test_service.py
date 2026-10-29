@@ -309,11 +309,48 @@ def test_create_feed_validation(svc):
         with pytest.raises(Invalid) as exc:
             svc.create_feed("Talks", slug=slug)
         assert str(exc.value) == "Slugs are 1 to 40 lowercase letters, digits and dashes."
-    for days in (0, -1, 1.5, "7"):
-        with pytest.raises(Invalid) as exc:
-            svc.create_feed("Talks", retention_days=days)
-        assert str(exc.value) == "Retention must be at least 1 day."
     assert svc.list_feeds() == []  # nothing was created by any of those
+
+
+@pytest.mark.parametrize("days", [0, -1, -(10**30), 1.5, "7", True, False])
+def test_retention_below_one_or_not_a_whole_number(svc, days):
+    with pytest.raises(Invalid) as exc:
+        svc.create_feed("Talks", retention_days=days)
+    assert str(exc.value) == "Retention must be at least 1 day."
+    assert svc.list_feeds() == []
+    svc.create_feed("Talks")
+    with pytest.raises(Invalid) as exc:
+        svc.update_feed("talks", title="Talks", description=None, retention_days=days)
+    assert str(exc.value) == "Retention must be at least 1 day."
+    assert svc.get_feed("talks").retention_days is None
+
+
+@pytest.mark.parametrize("days", [3651, 10**6, 10**30])
+def test_retention_over_ten_years(svc, days):
+    # The retention sweep subtracts it from the clock, which overflows far above this.
+    with pytest.raises(Invalid) as exc:
+        svc.create_feed("Talks", retention_days=days)
+    assert str(exc.value) == "Retention can be at most 3650 days."
+    assert svc.list_feeds() == []
+    svc.create_feed("Talks")
+    with pytest.raises(Invalid) as exc:
+        svc.update_feed("talks", title="Talks", description=None, retention_days=days)
+    assert str(exc.value) == "Retention can be at most 3650 days."
+    assert svc.get_feed("talks").retention_days is None
+
+
+def test_retention_limits_are_accepted(svc):
+    assert svc.create_feed("Short", retention_days=1).retention_days == 1
+    assert svc.create_feed("Long", retention_days=3650).retention_days == 3650
+    f = svc.update_feed("short", title="Short", description=None, retention_days=3650)
+    assert f.retention_days == 3650
+
+
+def test_the_longest_retention_does_not_break_the_sweep(svc, db):
+    # What the bound is for: expired() subtracts the retention from the clock.
+    svc.create_feed("Talks", retention_days=3650)
+    db.set_status(svc.add_episode(URL).id, "failed", "timed out")  # only failed/ready are checked
+    assert db.expired(30) == []
 
 
 def test_create_feed_slug_from_title_and_taken(svc):
@@ -414,16 +451,18 @@ def test_artwork_and_deleting_the_feed_do_not_race(svc, db, storage, monkeypatch
     # cover is then written into a folder nobody will ever clean up.
     svc.create_feed("Talks")
     real = db.get_feed
+    found = threading.Event()
 
     def slow(slug):
         feed = real(slug)
+        found.set()  # the artwork call holds its lock and has the feed
         time.sleep(0.15)
         return feed
 
     monkeypatch.setattr(db, "get_feed", slow)
     with ThreadPoolExecutor(2) as pool:
         artwork = pool.submit(svc.set_feed_artwork, "talks", PNG)
-        time.sleep(0.05)
+        assert found.wait(10)
         deleted = pool.submit(svc.delete_feed, "talks")
         artwork.result()
         deleted.result()
@@ -588,6 +627,9 @@ def test_list_episodes(svc, db):
     assert [e.id for e in svc.list_episodes(feed="talks", status="queued")] == [a.id]
     assert [e.id for e in svc.list_episodes(limit=2)] == [c.id, b.id]
     assert [e.id for e in svc.list_episodes(feed="  ")] == [c.id, b.id, a.id]
+    assert [e.id for e in svc.list_episodes(status="")] == [c.id, b.id, a.id]  # blank: any
+    assert [e.id for e in svc.list_episodes(status="  ", feed="talks")] == [b.id, a.id]
+    assert [e.id for e in svc.list_episodes(status=" failed ")] == [b.id]
 
 
 def test_list_episodes_default_limit_is_50_and_none_means_all(svc):

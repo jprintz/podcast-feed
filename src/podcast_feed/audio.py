@@ -40,6 +40,7 @@ AUDIO_BITRATE = "128k"
 MAX_ALLOC_BYTES = 128 * 1024 * 1024
 # The most of ffprobe's output that is read; its JSON holds every tag of the file.
 MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+
 _READ_SIZE = 64 * 1024
 _LOCAL_FILES_ONLY = ["-protocol_whitelist", "file"]
 # Formats whose files are lists of other files or streams; `format_name` can list several.
@@ -74,8 +75,8 @@ def _alloc_cap() -> list[str]:
 
 
 async def _read_all(stream: asyncio.StreamReader) -> bytes:
-    """Everything the stream gives, read as it comes; the file is not media if it is more than
-    MAX_OUTPUT_BYTES, and the rest is never read."""
+    """Everything the stream gives, read as it comes. EpisodeFailure (not media) as soon as it has
+    given more than MAX_OUTPUT_BYTES: the rest is never read."""
     chunks: list[bytes] = []
     size = 0
     while chunk := await stream.read(_READ_SIZE):
@@ -84,6 +85,21 @@ async def _read_all(stream: asyncio.StreamReader) -> bytes:
             raise EpisodeFailure(NOT_MEDIA)
         chunks.append(chunk)
     return b"".join(chunks)
+
+
+async def _kill(proc: asyncio.subprocess.Process) -> None:
+    """Kill the process, reap it and close its output pipe."""
+    with contextlib.suppress(ProcessLookupError):
+        proc.kill()
+    await proc.wait()
+    if proc.stdout is not None:
+        # A reader that stopped early has paused the pipe, which then never sees the end and
+        # stays open: what the dead process left in it is read (and dropped) to close it. The
+        # limit of a second is for a child that holds the pipe open (ffprobe has none).
+        with contextlib.suppress(TimeoutError):
+            async with asyncio.timeout(1):
+                while await proc.stdout.read(_READ_SIZE):
+                    pass
 
 
 async def _run(argv: list[str], timeout_s: float, *, capture: bool = False) -> tuple[int, bytes]:
@@ -105,14 +121,7 @@ async def _run(argv: list[str], timeout_s: float, *, capture: bool = False) -> t
     try:
         stdout = await asyncio.wait_for(finish(), timeout_s)
     except BaseException:
-        with contextlib.suppress(ProcessLookupError):
-            proc.kill()
-        await proc.wait()
-        if capture:
-            # A reader that stopped early has paused the pipe, which then never sees the end
-            # and stays open: what the dead process left in it is read (and dropped) to close it.
-            while await proc.stdout.read(_READ_SIZE):
-                pass
+        await _kill(proc)
         raise
     return proc.returncode, stdout
 

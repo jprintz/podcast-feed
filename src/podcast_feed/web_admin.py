@@ -7,8 +7,11 @@ makes sure a page on another site cannot make the browser of someone who is sign
 
 Starlette runs a sync endpoint in its thread pool, but these handlers read forms, which is async,
 so they are `async def`s and every service call goes through `asyncio.to_thread`: the service
-blocks (SQLite, files, locks) and must never run on the event loop. Every HTML response says
-`Cache-Control: no-store`, because the feed address is on the pages.
+blocks (SQLite, files, locks) and must never run on the event loop. Every HTML response and
+every redirect says `Cache-Control: no-store`, because the feed address is on the pages, and
+forbids framing (`X-Frame-Options`, `frame-ancestors`), so that no other site can lay an invisible
+copy of a page over its own and click through it; `nosniff` keeps a browser from second-guessing
+the content type.
 
 An `Invalid` or `NotFound` from the service shows its message as it is, in an element with
 role="alert": `Invalid` on the page the form was on (status 400), `NotFound` on a small page that
@@ -36,7 +39,12 @@ from podcast_feed.service import BAD_RETENTION, MAX_ARTWORK_BYTES, Service
 
 # Found through importlib.resources: the image installs the package, so there is no source tree.
 TEMPLATES_DIR = Path(str(resources.files("podcast_feed") / "templates"))
-NO_STORE = {"Cache-Control": "no-store"}
+PAGE_HEADERS = {
+    "Cache-Control": "no-store",
+    "X-Frame-Options": "DENY",  # the older spelling of frame-ancestors
+    "Content-Security-Policy": "frame-ancestors 'none'",
+    "X-Content-Type-Options": "nosniff",
+}
 REFUSED = "cross-site request refused\n"
 # What the worker is still busy with: the table refreshes itself until none is left.
 UNFINISHED = ("queued", "downloading", "converting")
@@ -191,7 +199,7 @@ def _feed_context(service: Service, slug: str) -> dict[str, Any]:
 
 
 def _redirect(url: str) -> Response:
-    return RedirectResponse(url, status_code=303, headers=NO_STORE)
+    return RedirectResponse(url, status_code=303, headers=PAGE_HEADERS)
 
 
 def _feed_location(slug: str) -> str:
@@ -203,7 +211,7 @@ def admin_routes(service: Service) -> list[Route]:
 
     def render(request: Request, name: str, context: dict[str, Any], status: int = 200) -> Response:
         return templates.TemplateResponse(
-            request, name, context, status_code=status, headers=NO_STORE
+            request, name, context, status_code=status, headers=PAGE_HEADERS
         )
 
     def not_found(request: Request, error: NotFound) -> Response:

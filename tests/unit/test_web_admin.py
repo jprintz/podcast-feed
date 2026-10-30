@@ -702,6 +702,28 @@ def test_admin_html_is_never_cached(client, svc, db, talks):
         assert response.headers["cache-control"] == "no-store", response.request.url
 
 
+def test_admin_pages_and_redirects_forbid_framing(client, svc, talks):
+    # The pages show the secret feed address, so no other site may frame them (clickjacking).
+    episode = svc.add_episode("https://x.example/a.mp3", feed="talks")
+    responses = [
+        client.get("/ui/"),
+        client.get("/ui/feeds/talks"),
+        client.get("/ui/feeds/talks/episodes"),
+        client.get("/ui/feeds/nope"),  # 404 page
+        post(client, "/ui/feeds", {"title": " "}),  # 400 page
+        post(client, "/ui/feeds", {"title": "Other"}),  # 303
+        post(client, f"/ui/episodes/{episode.id}/remove"),  # 303
+        post(client, "/ui/episodes/nope/remove"),  # 404 page
+    ]
+    assert [r.status_code for r in responses] == [200, 200, 200, 404, 400, 303, 303, 404]
+    for response in responses:
+        where = (response.status_code, response.request.url)
+        assert response.headers["x-frame-options"] == "DENY", where
+        assert response.headers["content-security-policy"] == "frame-ancestors 'none'", where
+        assert response.headers["x-content-type-options"] == "nosniff", where
+        assert response.headers["cache-control"] == "no-store", where  # still there
+
+
 def test_static_files(client):
     htmx = client.get("/ui/static/htmx.min.js")
     assert htmx.status_code == 200

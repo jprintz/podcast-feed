@@ -3,6 +3,7 @@
 import asyncio
 import os
 import shutil
+import socket
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -79,3 +80,38 @@ def media(ffmpeg_tools: None, tmp_path: Path):
         return make_media(tmp_path, kind)
 
     return make
+
+
+@pytest.fixture
+def free_port():
+    """A factory: `free_port()` returns a TCP port on 127.0.0.1 that nothing listens on, and
+    never the same one twice in a test."""
+    given: set[int] = set()
+
+    def make() -> int:
+        while True:
+            with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+                sock.bind(("127.0.0.1", 0))
+                port = sock.getsockname()[1]
+            if port not in given:
+                given.add(port)
+                return port
+
+    return make
+
+
+async def wait_until_listening(port: int, timeout: float = 10) -> None:
+    """Retry a TCP connect to 127.0.0.1:port until one works; TimeoutError after `timeout` s."""
+    loop = asyncio.get_running_loop()
+    deadline = loop.time() + timeout
+    while True:
+        try:
+            _, writer = await asyncio.open_connection("127.0.0.1", port)
+        except OSError:
+            if loop.time() >= deadline:
+                raise TimeoutError(f"nothing listens on 127.0.0.1:{port}") from None
+            await asyncio.sleep(0.05)
+        else:
+            writer.close()
+            await writer.wait_closed()
+            return

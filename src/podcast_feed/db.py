@@ -200,10 +200,15 @@ class Database:
             self._conn.execute("BEGIN IMMEDIATE")
             try:
                 yield self._conn
+                # COMMIT can fail (a deferred foreign key is checked here) and then leaves the
+                # transaction open, so it belongs in the try: the connection must not stay in it.
+                self._conn.execute("COMMIT")
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                # SQLite may have ended the transaction itself (ON CONFLICT ROLLBACK, a full disk),
+                # and a ROLLBACK then would raise and hide the error that matters.
+                if self._conn.in_transaction:
+                    self._conn.execute("ROLLBACK")
                 raise
-            self._conn.execute("COMMIT")
 
     def _touch(self, conn: sqlite3.Connection, feed_id: int, now: str) -> None:
         conn.execute("UPDATE feeds SET changed_at = ? WHERE id = ?", (now, feed_id))

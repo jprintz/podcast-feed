@@ -577,6 +577,45 @@ def test_data_survives_reopening_and_uses_wal(tmp_path, clock):
         second.close()
 
 
+def test_a_failed_commit_surfaces_and_leaves_the_connection_usable(db):
+    # A DEFERRABLE foreign key is checked at COMMIT, so the statement itself succeeds.
+    db._conn.execute("CREATE TABLE parent (id INTEGER PRIMARY KEY)")
+    db._conn.execute(
+        "CREATE TABLE child (parent_id INTEGER REFERENCES parent(id) DEFERRABLE INITIALLY DEFERRED)"
+    )
+    with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"):
+        with db._tx() as conn:
+            conn.execute("INSERT INTO child VALUES (42)")
+    assert not db._conn.in_transaction
+    assert db._conn.execute("SELECT COUNT(*) FROM child").fetchone()[0] == 0  # rolled back
+    # The connection is not stuck in the failed transaction: the next write works.
+    assert db.create_feed("a", "A").slug == "a"
+    assert [f.slug for f in db.list_feeds()] == ["a"]
+
+
+def test_the_original_error_surfaces_when_sqlite_has_already_rolled_back(db):
+    # ON CONFLICT ROLLBACK ends the transaction inside SQLite, so there is nothing to roll back.
+    db._conn.execute("CREATE TABLE once (n INTEGER PRIMARY KEY)")
+    with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"):
+        with db._tx() as conn:
+            conn.execute("INSERT INTO once VALUES (1)")
+            conn.execute("INSERT OR ROLLBACK INTO once VALUES (1)")
+    assert not db._conn.in_transaction
+    assert db.create_feed("a", "A").slug == "a"
+
+
+def test_a_body_that_ends_the_transaction_itself_surfaces_its_own_error(db):
+    class Boom(Exception):
+        pass
+
+    with pytest.raises(Boom):
+        with db._tx() as conn:
+            conn.execute("ROLLBACK")
+            raise Boom
+    assert not db._conn.in_transaction
+    assert db.create_feed("a", "A").slug == "a"
+
+
 def test_timestamps_are_utc_text_that_sorts_chronologically(db, clock):
     f = db.create_feed("a", "A")
     clock.set(datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC))

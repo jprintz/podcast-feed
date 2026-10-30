@@ -26,6 +26,10 @@ from podcast_feed.errors import Invalid, NotFound
 from podcast_feed.service import Service
 
 FEED_TYPE = "application/rss+xml; charset=utf-8"
+# The feed changes whenever an episode is published or edited, and a response without a
+# Cache-Control may be kept for a while by guesswork (a fraction of its age from Last-Modified):
+# so it is stored but checked again on every use, which the ETag makes cheap.
+FEED_CACHE = "private, no-cache"
 # Episodes and covers are never edited in place, and a replaced cover gets a new ?v= in the feed.
 MEDIA_CACHE = "private, max-age=86400"
 
@@ -82,7 +86,11 @@ def public_routes(service: Service) -> list[Route]:
         # The hash of the bytes, not of the change time: that has whole-second resolution, and
         # a feed can change twice in a second.
         etag = f'"{hashlib.sha1(body, usedforsecurity=False).hexdigest()}"'
-        headers = {"ETag": etag, "Last-Modified": format_datetime(changed_at, usegmt=True)}
+        headers = {
+            "ETag": etag,
+            "Last-Modified": format_datetime(changed_at, usegmt=True),
+            "Cache-Control": FEED_CACHE,
+        }
         if _etag_matches(",".join(request.headers.getlist("if-none-match")), etag):
             return Response(status_code=304, headers=headers)
         # For HEAD the ASGI server drops the body and keeps the headers, Content-Length included.

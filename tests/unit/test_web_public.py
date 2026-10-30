@@ -168,6 +168,22 @@ def test_feed_head(client):
     assert again.status_code == 304 and again.content == b""
 
 
+def test_the_feed_is_revalidated_on_every_use(client):
+    # Without a Cache-Control a cache may guess a freshness lifetime from Last-Modified and
+    # keep serving an old feed; the 304 repeats the header, as RFC 9111 has it update the entry.
+    etag = client.get("/feeds/talks.xml").headers["etag"]
+    conditional = {"If-None-Match": etag}
+    responses = [
+        (200, client.get("/feeds/talks.xml")),
+        (304, client.get("/feeds/talks.xml", headers=conditional)),
+        (200, client.head("/feeds/talks.xml")),
+        (304, client.head("/feeds/talks.xml", headers=conditional)),
+    ]
+    for status, response in responses:
+        assert response.status_code == status
+        assert response.headers["cache-control"] == "private, no-cache", (status, response.request)
+
+
 @pytest.mark.parametrize(
     "path",
     ["/feeds/nope.xml", "/feeds/Talks.xml", "/feeds/a.b.xml", "/feeds/%00.xml", "/feeds/-.xml"],

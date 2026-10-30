@@ -263,11 +263,14 @@ class Service:
             self._db.set_default(slug)
 
     def delete_feed(self, slug: str) -> None:
-        """Delete the feed, its episodes and its folder. The rows go first: a file that outlives
-        its row is only clutter, a row without its file is a broken feed."""
+        """Delete the feed, its episodes and its folder, and the files of its uploads that still
+        wait for the worker. The rows go first: a file that outlives its row is only clutter, a
+        row without its file is a broken feed."""
         with self._feed_files_lock:
             with _feed_exists(slug):
-                self._db.delete_feed(slug)
+                unfinished = self._db.delete_feed(slug)
+            for episode_id in unfinished:  # no file, unless it was an upload that still waited
+                self._storage.delete_upload(episode_id)
             self._storage.delete_feed(slug)
 
     def feed_url(self, slug: str) -> str:
@@ -367,8 +370,9 @@ class Service:
     def start_upload(
         self, feed: str | None, filename: str | None, declared_size: int | None
     ) -> PendingUpload:
-        """Check that an upload of `declared_size` bytes (None: not known) can be taken into the
-        feed (slug), or the default feed, and say where to write it.
+        """Check that an upload of `declared_size` bytes can be taken into the feed (slug), or
+        the default feed, and say where to write it. An unknown size (None: no Content-Length)
+        may be as big as the limit, so room for all of it is kept.
 
         Nothing is written yet. The caller writes the body to `part`, counting what arrives, and
         then calls finish_upload, or abort_upload if the body did not arrive: until finish_upload
@@ -377,7 +381,8 @@ class Service:
         target = self._feed_for_add(feed)
         if declared_size is not None and declared_size > MAX_UPLOAD_BYTES:
             raise TooLarge(UPLOAD_TOO_LARGE)
-        if self._storage.free_bytes() < self._settings.min_free_bytes + (declared_size or 0):
+        reserved = MAX_UPLOAD_BYTES if declared_size is None else declared_size
+        if self._storage.free_bytes() < self._settings.min_free_bytes + reserved:
             raise Invalid(UPLOAD_DISK)
         episode_id = new_episode_id()
         return PendingUpload(
@@ -413,8 +418,11 @@ class Service:
                     _episode_text(description, DESCRIPTION_MAX),
                     upload.id,
                 )
-            except sqlite3.IntegrityError:
-                # The feed was deleted after it was looked up: the episode has no feed to belong to.
+            except sqlite3.IntegrityError as exc:
+                # Only a failed foreign key means that the feed was deleted after it was looked
+                # up; any other constraint (an id that is taken) is not that, and stays an error.
+                if getattr(exc, "sqlite_errorname", None) != "SQLITE_CONSTRAINT_FOREIGNKEY":
+                    raise
                 raise _unknown_feed(upload.feed_slug) from None
         except BaseException:
             self._storage.delete_upload(upload.id)

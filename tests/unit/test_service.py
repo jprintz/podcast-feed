@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import sqlite3
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -7,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from podcast_feed import service as service_module
 from podcast_feed.config import GIB, Settings
 from podcast_feed.db import Database, Episode
 from podcast_feed.errors import Invalid, NotFound, TooLarge
@@ -27,9 +29,12 @@ def db():
 
 
 @pytest.fixture
-def storage(tmp_path):
+def storage(tmp_path, monkeypatch):
     store = Storage(tmp_path / "media")
     store.ensure_layout()
+    # Plenty of room whatever the machine running the tests has; a test that is about the
+    # floor sets its own.
+    monkeypatch.setattr(store, "free_bytes", lambda: 100 * GIB)
     return store
 
 
@@ -1177,3 +1182,54 @@ def test_removing_an_episode_leaves_the_files_of_other_uploads(svc, storage):
     gone = svc.finish_upload(receive(svc))
     svc.remove_episode(gone.id)
     assert tmp_files(storage) == [f"{keep.id}.upload"]
+
+
+def test_deleting_a_feed_takes_the_files_of_its_waiting_uploads(svc, db, storage):
+    svc.create_feed("Talks")
+    svc.create_feed("B")
+    waiting = svc.finish_upload(receive(svc, feed="talks"))
+    assert storage.upload_ready(waiting.id).exists()
+    failed = svc.finish_upload(receive(svc, feed="talks"))
+    db.set_status(failed.id, "failed", "not an audio or video file")
+    storage.upload_ready(failed.id).unlink()  # the worker deletes it when its job ends
+    other = svc.finish_upload(receive(svc, feed="b"))
+    unfinished = receive(svc, feed="talks")  # still arriving: not an episode yet
+    svc.delete_feed("talks")
+    assert tmp_files(storage) == sorted([f"{other.id}.upload", f"{unfinished.id}.part"])
+    assert [e.id for e in svc.list_episodes()] == [other.id]
+    assert not storage.upload_ready(waiting.id).exists()
+
+
+def test_a_feed_with_a_waiting_upload_is_deleted_even_if_the_folder_cannot_be(
+    svc, storage, monkeypatch
+):
+    svc.create_feed("Talks")
+    e = svc.finish_upload(receive(svc))
+
+    def boom(slug):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(storage, "delete_feed", boom)
+    with pytest.raises(OSError):
+        svc.delete_feed("talks")
+    assert not storage.upload_ready(e.id).exists()  # the upload's file went with its row
+    assert svc.list_feeds() == []
+
+
+def test_an_upload_of_unknown_size_reserves_room_for_the_whole_limit(svc, storage, monkeypatch):
+    svc.create_feed("Talks")
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + MAX_UPLOAD_BYTES - 1)
+    with pytest.raises(Invalid, match="nearly out of disk space"):
+        svc.start_upload(None, "a.mp3", None)
+    svc.start_upload(None, "a.mp3", 1000)  # a known, small size still fits
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + MAX_UPLOAD_BYTES)
+    svc.start_upload(None, "a.mp3", None)
+
+
+def test_an_id_that_is_taken_is_not_taken_for_a_deleted_feed(svc, monkeypatch):
+    """Only the feed's foreign key means the feed is gone; any other constraint is a bug."""
+    svc.create_feed("Talks")
+    monkeypatch.setattr(service_module, "new_episode_id", lambda: "abcdefghijkl")
+    svc.finish_upload(receive(svc, filename="one.mp3"))
+    with pytest.raises(sqlite3.IntegrityError):  # another source, the same id
+        svc.finish_upload(receive(svc, filename="two.mp3"))

@@ -34,9 +34,12 @@ def db():
 
 
 @pytest.fixture
-def storage(tmp_path):
+def storage(tmp_path, monkeypatch):
     store = Storage(tmp_path / "media")
     store.ensure_layout()
+    # Plenty of room whatever the machine running the tests has; a test that is about the
+    # floor sets its own.
+    monkeypatch.setattr(store, "free_bytes", lambda: 100 * GIB)
     return store
 
 

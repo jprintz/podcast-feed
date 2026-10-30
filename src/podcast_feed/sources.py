@@ -2,9 +2,11 @@
 
 `HttpFileSource` is the only one so far: it follows redirects itself, so that the guard
 checks every hop, and it refuses web pages and files over the size limit before they fill
-the disk.
+the disk. The whole download has a time limit too: httpx's timeouts are per read, and a server
+that sends a byte now and then would hold the (single) worker for ever.
 """
 
+import asyncio
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass
@@ -85,15 +87,27 @@ class HttpFileSource:
 
     kind = "url"
 
-    def __init__(self, client: httpx.AsyncClient, max_bytes: int, max_redirects: int = 5) -> None:
+    def __init__(
+        self,
+        client: httpx.AsyncClient,
+        max_bytes: int,
+        max_redirects: int = 5,
+        max_seconds: float = 7200,
+    ) -> None:
         # The client must not follow redirects itself (guard.guarded_client does not).
         self._client = client
         self._max_bytes = max_bytes
         self._max_redirects = max_redirects
+        self._max_seconds = max_seconds
 
     async def fetch(self, ref: str, dest: Path) -> Fetched:
         try:
-            return await self._download(ref, dest)
+            try:
+                # From the first request to the last byte: redirects and the body included.
+                async with asyncio.timeout(self._max_seconds):
+                    return await self._download(ref, dest)
+            except TimeoutError:  # httpx's own timeouts are EpisodeFailures by now
+                raise EpisodeFailure("timed out") from None
         except BaseException:  # failures and cancellation alike leave no half file behind
             dest.unlink(missing_ok=True)
             raise

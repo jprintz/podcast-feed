@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 import logging
 import traceback
 
@@ -420,6 +421,63 @@ async def test_connect_error(make_source, tmp_path):
 async def test_other_transport_errors_are_could_not_connect(make_source, tmp_path, exc):
     with pytest.raises(EpisodeFailure, match="^could not connect$"):
         await make_source(fails(exc)).fetch("https://x.example/f.mp3", tmp_path / "dl")
+
+
+async def trickle():
+    """A body that gives a first chunk at once (more than a read's worth, so that it is on disk)
+    and then a byte every 50 ms for as long as anyone reads: no read ever times out."""
+    yield b"x" * 70_000
+    while True:
+        await asyncio.sleep(0.05)
+        yield b"y"
+
+
+async def slow_response(request: httpx.Request) -> httpx.Response:
+    await asyncio.sleep(30)  # the server takes its time to answer at all
+    return httpx.Response(200, content=b"abc")
+
+
+@pytest.mark.parametrize("slowness", ["body", "response"])
+async def test_a_download_has_a_total_time_limit(make_source, tmp_path, slowness):
+    """The per-read timeouts never fire on a server that keeps sending something, so the whole
+    download is limited: it ends as `timed out`, nothing is left behind and nothing of the
+    link is in the failure."""
+    link = "https://x.example/" + "private-path" + "?token=" + "hunter2"
+    handler = (
+        slow_response
+        if slowness == "response"
+        else lambda r: httpx.Response(200, content=trickle())
+    )
+    dest = tmp_path / "dl"
+    source = make_source(handler, max_bytes=10**9, max_seconds=0.2)
+    with pytest.raises(EpisodeFailure) as info:
+        await asyncio.wait_for(source.fetch(link, dest), 5)  # a missing limit fails, not hangs
+    assert str(info.value) == "timed out"
+    assert not dest.exists() and list(tmp_path.iterdir()) == []
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+    for leak in ("private-path", "hunter2"):
+        assert leak not in "".join(traceback.format_exception(info.value)), leak
+
+
+async def test_the_time_limit_covers_every_redirect_hop(make_source, tmp_path):
+    def handler(request):
+        if request.url.path == "/start":
+            return httpx.Response(302, headers={"Location": "/slow"})
+        return slow_response(request)
+
+    with pytest.raises(EpisodeFailure, match="^timed out$"):
+        await make_source(handler, max_seconds=0.2).fetch(
+            "https://x.example/start", tmp_path / "dl"
+        )
+
+
+async def test_a_download_within_the_time_limit_is_untouched(make_source, tmp_path):
+    f = await make_source(ok, max_seconds=5).fetch("https://x.example/f.mp3", tmp_path / "dl")
+    assert f.path.read_bytes() == b"abc"
+
+
+def test_the_default_time_limit_is_two_hours():
+    assert inspect.signature(HttpFileSource).parameters["max_seconds"].default == 7200
 
 
 @pytest.mark.parametrize("reason", ["blocked address", "could not connect", "timed out"])

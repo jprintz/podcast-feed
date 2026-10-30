@@ -1,4 +1,6 @@
 import asyncio
+import logging
+import traceback
 
 import httpx
 import pytest
@@ -426,6 +428,40 @@ async def test_the_guards_failure_passes_through_unchanged(make_source, tmp_path
     with pytest.raises(EpisodeFailure) as info:
         await make_source(fails(failure)).fetch("https://x.example/f.mp3", tmp_path / "dl")
     assert info.value is failure
+
+
+@pytest.mark.parametrize(
+    "location",
+    [
+        "http://xn--a-ecp.ru/f.mp3",  # decodes to a⒈, a codepoint idna does not allow
+        "http://xn--/f.mp3",  # a malformed A-label
+        "//xn--9999999999.example/f.mp3",  # an invalid one, and no scheme
+    ],
+)
+async def test_redirect_to_a_host_idna_cannot_decode_is_blocked(
+    make_source, tmp_path, caplog, location
+):
+    """httpx decodes the host of a Location itself, before the guard sees the link, and idna's
+    error quotes the label: it must end as `blocked address` and leave no trace of the label."""
+    caplog.set_level(logging.DEBUG)
+    requests: list[httpx.Request] = []
+
+    def handler(request):
+        requests.append(request)
+        return httpx.Response(302, headers={"Location": location})
+
+    dest = tmp_path / "dl"
+    dest.write_bytes(b"left over")
+    with pytest.raises(EpisodeFailure) as info:
+        await make_source(handler).fetch("https://x.example/start", dest)
+    assert str(info.value) == "blocked address"
+    assert len(requests) == 1  # nothing was requested from the bad host
+    assert not dest.exists()
+    assert info.value.__cause__ is None and info.value.__suppress_context__
+    for leak in ("a\u2488", "xn--a-ecp", "xn--9999999999"):
+        assert leak not in caplog.text, leak
+        assert all(leak not in r.getMessage() for r in caplog.records), leak
+        assert leak not in "".join(traceback.format_exception(info.value)), leak
 
 
 async def test_the_guards_failure_on_a_redirect_hop(make_source, tmp_path):

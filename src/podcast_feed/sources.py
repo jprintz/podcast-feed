@@ -105,6 +105,13 @@ class HttpFileSource:
             raise EpisodeFailure("timed out") from exc
         except httpx.TransportError as exc:
             raise EpisodeFailure("could not connect") from exc
+        except UnicodeError:
+            # httpx decodes the host of a redirect's Location itself, before _checked sees the
+            # link, and idna's errors (UnicodeErrors) quote the label. A host that cannot be
+            # decoded is a link the guard would refuse; the error is not kept, so that nothing
+            # of the label reaches a log through it. (EpisodeFailure is not a UnicodeError:
+            # the guard's own failures pass through.)
+            raise EpisodeFailure("blocked address") from None
 
     async def _follow(self, ref: str, dest: Path) -> Fetched:
         url = _checked(ref)

@@ -2,12 +2,14 @@ import asyncio
 import inspect
 import logging
 import traceback
+from dataclasses import dataclass, field
 
 import httpx
 import pytest
 
 from podcast_feed import __version__
 from podcast_feed.errors import EpisodeFailure
+from podcast_feed.guard import guarded_client
 from podcast_feed.sources import Fetched, HttpFileSource, filename_from
 
 MAX_BYTES = 1000
@@ -617,3 +619,82 @@ async def test_nothing_is_left_in_the_directory_on_failure(make_source, tmp_path
     with pytest.raises(EpisodeFailure):
         await make_source(handler).fetch("https://x.example/page", tmp_path / "dl")
     assert list(tmp_path.iterdir()) == []
+
+
+# ------------------------------------------------------ the guard and the source together
+
+
+@dataclass
+class RedirectServer:
+    """A server on 127.0.0.1 and the request lines it was sent, in order."""
+
+    port: int = 0
+    requests: list[str] = field(default_factory=list)
+
+
+@pytest.fixture
+async def redirect_server():
+    """Answers `/start` with a 302 to http://internal.test:<its own port>/secret and any other
+    path with a little audio, and hangs up after each answer."""
+    seen = RedirectServer()
+
+    async def handle(reader: asyncio.StreamReader, writer: asyncio.StreamWriter) -> None:
+        try:
+            head = (await reader.readuntil(b"\r\n\r\n")).decode("latin-1")
+            request_line = head.split("\r\n")[0]
+            seen.requests.append(request_line)
+            if request_line.split()[1] == "/start":
+                answer = (
+                    f"HTTP/1.1 302 Found\r\nLocation: http://internal.test:{seen.port}/secret\r\n"
+                    "content-length: 0\r\nconnection: close\r\n\r\n"
+                )
+            else:
+                answer = (
+                    "HTTP/1.1 200 OK\r\ncontent-type: audio/mpeg\r\ncontent-length: 3\r\n"
+                    "connection: close\r\n\r\nabc"
+                )
+            writer.write(answer.encode())
+            await writer.drain()
+        except (asyncio.IncompleteReadError, asyncio.LimitOverrunError, ConnectionError):
+            pass
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(handle, "127.0.0.1", 0)
+    seen.port = server.sockets[0].getsockname()[1]
+    async with server:
+        yield seen
+
+
+def guard_with_a_private_name():
+    """The real guard. files.test is on 127.0.0.1, which stands in for a public address (the
+    server must be reachable); internal.test is on 127.0.0.2, which is refused."""
+    answers = {"files.test": ["127.0.0.1"], "internal.test": ["127.0.0.2"]}
+
+    async def resolve(host, port):
+        return answers[host]
+
+    return guarded_client(resolve=resolve, is_allowed=lambda ip: ip == "127.0.0.1")
+
+
+async def test_a_link_to_an_allowed_address_downloads(redirect_server, tmp_path):
+    async with guard_with_a_private_name() as client:
+        link = f"http://files.test:{redirect_server.port}/file"
+        fetched = await HttpFileSource(client, MAX_BYTES).fetch(link, tmp_path / "dl")
+    assert fetched.path.read_bytes() == b"abc"
+    assert redirect_server.requests == ["GET /file HTTP/1.1"]
+
+
+async def test_a_redirect_to_a_private_address_is_blocked_before_any_request(
+    redirect_server, tmp_path
+):
+    """The real guarded client and the real source together: the guard's mock-transport tests
+    cannot show that a hop that resolves to a refused address is never connected to."""
+    link = f"http://files.test:{redirect_server.port}/start"
+    dest = tmp_path / "dl"
+    async with guard_with_a_private_name() as client:
+        with pytest.raises(EpisodeFailure) as info:
+            await HttpFileSource(client, MAX_BYTES).fetch(link, dest)
+    assert str(info.value) == "blocked address"
+    assert redirect_server.requests == ["GET /start HTTP/1.1"]  # /secret was never asked for
+    assert not dest.exists()

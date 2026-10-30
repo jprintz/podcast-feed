@@ -1,0 +1,69 @@
+{% extends "base.html" %}
+{% block title %}{{ feed.title }}{% endblock %}
+{% block content %}
+{# What was typed into a form that was refused, by form: shown again instead of the stored value. #}
+{% set add = values.add or {} %}
+{% set conf = values.settings or {} %}
+<p><a href="/ui/">All feeds</a></p>
+<h1>{{ feed.title }}</h1>
+<p class="muted">{{ feed.slug }}{% if feed.is_default %} &middot; default feed{% endif %}</p>
+
+<section>
+  <h2>Feed address</h2>
+  <p>Add this address to a podcast app. Anyone who has it can listen, so keep it to yourself.</p>
+  <div class="row">
+    <input type="text" readonly value="{{ feed_url }}" aria-label="Feed address">
+    <button type="button" data-copy="{{ feed_url }}">Copy</button>
+  </div>
+</section>
+
+<section>
+  <h2>Episodes</h2>
+  {% include "_episodes.html" %}
+
+  <h3>Add an episode</h3>
+  <form method="post" action="/ui/feeds/{{ feed.slug }}/episodes">
+    <label for="url">Link to an audio or video file</label>
+    <input type="url" id="url" name="url" required value="{{ add.url or '' }}">
+    <label for="episode-title">Title (optional: taken from the file)</label>
+    <input type="text" id="episode-title" name="title" value="{{ add.title or '' }}">
+    <p><button type="submit">Add episode</button></p>
+  </form>
+</section>
+
+<section>
+  <h2>Settings</h2>
+  <form method="post" action="/ui/feeds/{{ feed.slug }}/settings">
+    <label for="feed-title">Title</label>
+    <input type="text" id="feed-title" name="title" required value="{{ conf.title if 'title' in conf else feed.title }}">
+    <label for="feed-description">Description</label>
+    <textarea id="feed-description" name="description" rows="3">{{ conf.description if 'description' in conf else (feed.description or '') }}</textarea>
+    <label for="feed-retention">Keep episodes for this many days (empty: the default)</label>
+    <input type="text" id="feed-retention" name="retention_days" inputmode="numeric" value="{{ conf.retention_days if 'retention_days' in conf else (feed.retention_days or '') }}">
+    <p class="muted">Episodes are removed {{ retention_days }} days after they were added.</p>
+    <p><button type="submit">Save settings</button></p>
+  </form>
+
+  {% if not feed.is_default %}
+  <h3>Default feed</h3>
+  <p>New episodes go to the default feed when no feed is named.</p>
+  <form method="post" action="/ui/feeds/{{ feed.slug }}/default"><button type="submit">Make this the default feed</button></form>
+  {% endif %}
+
+  <h3>Artwork</h3>
+  <p>{% if feed.artwork %}This feed has artwork.{% else %}This feed has no artwork.{% endif %} PNG or JPEG, up to 5 MB.</p>
+  <form method="post" action="/ui/feeds/{{ feed.slug }}/artwork" enctype="multipart/form-data">
+    <input type="file" name="artwork" accept="image/png,image/jpeg" required aria-label="Artwork file">
+    <button type="submit">Upload artwork</button>
+  </form>
+</section>
+
+<section>
+  <h2>Delete this feed</h2>
+  <p>This deletes the feed with all its episodes and files, and its address stops working. Type its slug, <code>{{ feed.slug }}</code>, to confirm.</p>
+  <form method="post" action="/ui/feeds/{{ feed.slug }}/delete">
+    <input type="text" name="confirm" required autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Type the slug to confirm">
+    <button type="submit" class="danger">Delete feed</button>
+  </form>
+</section>
+{% endblock %}

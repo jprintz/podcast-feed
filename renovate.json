@@ -1,0 +1,22 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": ["config:recommended"],
+  "labels": ["dependencies"],
+  "lockFileMaintenance": { "enabled": true },
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "The static-ffmpeg image the CI tests copy ffmpeg and ffprobe from (the Dockerfile's copy is found without this)",
+      "managerFilePatterns": ["/^\\.github/workflows/ci\\.yml$/"],
+      "matchStrings": ["_IMAGE: (?<depName>[a-z0-9./-]+):(?<currentValue>[^\\s\"]+)"],
+      "datasourceTemplate": "docker"
+    }
+  ],
+  "packageRules": [
+    {
+      "description": "One pull request moves static-ffmpeg in the Dockerfile and in CI together",
+      "matchPackageNames": ["docker.io/mwader/static-ffmpeg", "mwader/static-ffmpeg"],
+      "groupName": "static-ffmpeg"
+    }
+  ]
+}

@@ -1,0 +1,42 @@
+{% extends "base.html" %}
+{% block title %}Podcast feeds{% endblock %}
+{% block content %}
+<h1>Feeds</h1>
+
+{% if summaries %}
+<div class="scroll">
+  <table>
+    <thead><tr><th>Feed</th><th>Slug</th><th>Episodes</th><th>Kept for</th></tr></thead>
+    <tbody>
+    {% for summary in summaries %}
+      <tr>
+        <td><a href="/ui/feeds/{{ summary.feed.slug }}">{{ summary.feed.title }}</a>{% if summary.feed.is_default %} <span class="muted">(default)</span>{% endif %}</td>
+        <td>{{ summary.feed.slug }}</td>
+        <td>{{ summary.episode_count }}</td>
+        <td>{{ summary.retention_days }} days</td>
+      </tr>
+    {% endfor %}
+    </tbody>
+  </table>
+</div>
+{% else %}
+<p>No feeds yet. Create the first one below; it becomes the default feed.</p>
+{% endif %}
+
+<section>
+  <h2>New feed</h2>
+  <form method="post" action="/ui/feeds" enctype="multipart/form-data">
+    <label for="title">Title</label>
+    <input type="text" id="title" name="title" required value="{{ values.title or '' }}">
+    <label for="slug">Slug (optional: made from the title)</label>
+    <input type="text" id="slug" name="slug" autocapitalize="off" spellcheck="false" value="{{ values.slug or '' }}">
+    <label for="description">Description (optional)</label>
+    <textarea id="description" name="description" rows="3">{{ values.description or '' }}</textarea>
+    <label for="retention_days">Keep episodes for this many days (optional: the default)</label>
+    <input type="text" id="retention_days" name="retention_days" inputmode="numeric" value="{{ values.retention_days or '' }}">
+    <label for="artwork">Artwork (optional, PNG or JPEG, up to 5 MB)</label>
+    <input type="file" id="artwork" name="artwork" accept="image/png,image/jpeg">
+    <p><button type="submit">Create feed</button></p>
+  </form>
+</section>
+{% endblock %}

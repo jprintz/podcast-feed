@@ -1,0 +1,36 @@
+<div id="episodes"{% if polling %} hx-get="/ui/feeds/{{ feed.slug }}/episodes" hx-trigger="every 3s" hx-swap="outerHTML"{% endif %}>
+{% if episodes %}
+  <div class="scroll">
+    <table>
+      <thead><tr><th>Episode</th><th>Status</th><th>Added</th><th>Actions</th></tr></thead>
+      <tbody>
+      {% for episode in episodes %}
+        <tr>
+          <td>{% if episode.title %}{{ episode.title }}{% else %}<span class="muted">{{ episode|source_host }}</span>{% endif %}</td>
+          <td>{{ episode|status_text }}</td>
+          <td><time datetime="{{ episode.added_at.isoformat() }}">{{ episode|added }}</time></td>
+          <td class="actions">
+            <details>
+              <summary>Edit</summary>
+              <form method="post" action="/ui/episodes/{{ episode.id }}/edit">
+                <label for="title-{{ episode.id }}">Title (empty for none)</label>
+                <input type="text" id="title-{{ episode.id }}" name="title" value="{{ episode.title or '' }}">
+                <label for="description-{{ episode.id }}">Description</label>
+                <textarea id="description-{{ episode.id }}" name="description" rows="3">{{ episode.description or '' }}</textarea>
+                <p><button type="submit">Save</button></p>
+              </form>
+            </details>
+            {% if episode.status == "failed" %}
+            <form method="post" action="/ui/episodes/{{ episode.id }}/retry"><button type="submit">Retry</button></form>
+            {% endif %}
+            <form method="post" action="/ui/episodes/{{ episode.id }}/remove"><button type="submit" data-confirm="Remove this episode and its files?">Remove</button></form>
+          </td>
+        </tr>
+      {% endfor %}
+      </tbody>
+    </table>
+  </div>
+{% else %}
+  <p class="muted">No episodes yet.</p>
+{% endif %}
+</div>

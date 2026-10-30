@@ -1,10 +1,12 @@
 import asyncio
 import logging
 import os
+import re
 import signal
 import socket
 import sys
 
+import httpx
 import pytest
 from starlette.testclient import TestClient
 
@@ -13,6 +15,7 @@ from podcast_feed.config import Settings
 from podcast_feed.db import Database
 from podcast_feed.guard import guarded_client
 from podcast_feed.main import build, configure_logging, main, serve
+from podcast_feed.service import MAX_UPLOAD_BYTES
 from podcast_feed.worker import Worker
 from tests.conftest import wait_until_listening
 
@@ -261,6 +264,83 @@ async def test_an_open_download_does_not_hold_up_the_stop(tmp_path, free_port, m
     finally:
         writer.close()
     assert not is_listening(settings.web_port)
+
+
+# ------------------------------------------------------------------------------ uploads
+
+SAME_ORIGIN = {"Sec-Fetch-Site": "same-origin"}
+
+
+@pytest.fixture
+async def running(tmp_path, free_port):
+    """The real stack (both listeners, the worker) on free ports; yields its settings."""
+    settings = listening_settings(tmp_path, free_port)
+    stop = asyncio.Event()
+    task = asyncio.create_task(serve(settings, stop))
+    await wait_until_listening(settings.web_port)
+    yield settings
+    stop.set()
+    await asyncio.wait_for(task, 10)
+
+
+async def test_an_uploaded_file_becomes_an_episode_in_the_feed(running, media):
+    """The whole way, with real uvicorn, the real worker and real ffmpeg: the file goes in as
+    the body of a request and comes out of the feed's audio link."""
+    body = media("mp3").read_bytes()
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{running.web_port}") as client:
+        created = await client.post("/ui/feeds", data={"title": "Talks"}, headers=SAME_ORIGIN)
+        assert created.status_code == 303
+        sent = await client.post(
+            "/ui/feeds/talks/upload",
+            content=body,
+            headers={**SAME_ORIGIN, "X-Upload-Name": "tone.mp3"},
+        )
+        assert (sent.status_code, sent.content) == (204, b"")
+        async with asyncio.timeout(30):
+            while "<enclosure" not in (feed := await client.get("/feeds/talks.xml")).text:
+                await asyncio.sleep(0.1)
+        link = re.search(r'<enclosure url="([^"]+)"', feed.text).group(1)
+        assert link.startswith(f"{PUBLIC_BASE}/media/talks/")
+        audio = await client.get(link.removeprefix(PUBLIC_BASE))
+        assert audio.status_code == 200 and audio.headers["content-type"] == "audio/mpeg"
+        assert audio.content and "<title>Tone</title>" in feed.text
+    assert not any((running.media_dir / ".tmp").iterdir())  # no upload file is left
+
+
+async def test_a_body_that_stops_halfway_leaves_nothing(running):
+    reader, writer = await asyncio.open_connection("127.0.0.1", running.web_port)
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{running.web_port}") as client:
+        await client.post("/ui/feeds", data={"title": "Talks"}, headers=SAME_ORIGIN)
+    writer.write(
+        b"POST /ui/feeds/talks/upload HTTP/1.1\r\nHost: x\r\nSec-Fetch-Site: same-origin\r\n"
+        b"Content-Length: 100000\r\n\r\n" + b"x" * 1000
+    )
+    await writer.drain()
+    tmp = running.media_dir / ".tmp"
+    async with asyncio.timeout(5):
+        while not any(tmp.iterdir()):  # it is being received
+            await asyncio.sleep(0.01)
+    writer.close()  # the browser goes away
+    async with asyncio.timeout(5):
+        while any(tmp.iterdir()):
+            await asyncio.sleep(0.01)
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{running.web_port}") as client:
+        assert "No episodes yet" in (await client.get("/ui/feeds/talks")).text
+
+
+async def test_a_declared_size_over_the_limit_is_answered_without_reading_the_body(running):
+    async with httpx.AsyncClient(base_url=f"http://127.0.0.1:{running.web_port}") as client:
+        await client.post("/ui/feeds", data={"title": "Talks"}, headers=SAME_ORIGIN)
+    reader, writer = await asyncio.open_connection("127.0.0.1", running.web_port)
+    try:
+        writer.write(
+            b"POST /ui/feeds/talks/upload HTTP/1.1\r\nHost: x\r\nSec-Fetch-Site: same-origin\r\n"
+            + f"Content-Length: {MAX_UPLOAD_BYTES + 1}\r\n\r\n".encode()
+        )  # and no body at all
+        await writer.drain()
+        assert (await asyncio.wait_for(reader.readline(), 5)).startswith(b"HTTP/1.1 413")
+    finally:
+        writer.close()
 
 
 # ---------------------------------------------------------------------------------- main

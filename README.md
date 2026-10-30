@@ -1,14 +1,15 @@
 # podcast-feed
 
-Private podcast feeds from links to audio and video files. Add a direct link to a file, and
-podcast-feed downloads it, makes AAC audio of it (an MP3 file stays as it is) and publishes
-it as an episode in an RSS feed that any podcast app can subscribe to. An admin UI manages the
-feeds and episodes, and an [MCP](https://modelcontextprotocol.io) server lets Claude add and
-remove episodes.
+Private podcast feeds from links to audio and video files. Add a direct link to a file (or
+upload one in the admin UI), and podcast-feed downloads it, makes AAC audio of it (an MP3 file
+stays as it is) and publishes it as an episode in an RSS feed that any podcast app can
+subscribe to. An admin UI manages the feeds and episodes, and an
+[MCP](https://modelcontextprotocol.io) server lets Claude add and remove episodes.
 
 - **Direct links only:** a link to a file, not to a web page or a YouTube video. Every
   connection, redirects included, goes only to public addresses ("blocked address" otherwise),
   with limits on size, duration and free disk space.
+- **Or an upload,** in the admin UI only, up to 100 MB (see [Uploading a file](#uploading-a-file)).
 - **Several feeds**, created in the admin UI. One of them is the default for new episodes.
 - **Retention:** an episode is deleted 30 days after it was added (per-feed override).
 - **One process:** SQLite for the index, audio files on disk, ffmpeg for the conversion. A
@@ -35,6 +36,31 @@ the admin UI only.
 
 Neither listener has a login of its own. Put both behind something that authenticates every
 request: the author runs the admin UI and the MCP server behind Cloudflare Access.
+
+## Uploading a file
+
+On a feed's page, "Upload a file" takes an audio or video file from your computer: the same
+kinds a link can point to, converted the same way. The title is optional, as for a link: the
+file's own title tag, else its name without the extension.
+
+- **100 MB at most.** The upload is one request, and Cloudflare refuses a request body over
+  100 MB on its free plan, so a bigger file could not get through the tunnel to the app anyway.
+  The page says so before it sends anything, and the app refuses too, by the declared size and
+  by counting what arrives. A bigger file has to be added by link. (`PODCAST_MAX_BYTES` still
+  applies to links; the upload limit is separate, and lower.)
+- **It needs JavaScript.** The page's script sends the file as the raw body of the request
+  (with a progress bar), so that the app writes it to disk as it arrives; a plain form would be
+  spooled by the web framework into `/tmp`, which in a read-only container is RAM-backed and
+  counts against the memory limit. Without script, the section stays hidden, so there is no
+  button that does nothing.
+- **Failed uploads are not retried.** The file is deleted when its job ends, so a failed
+  upload row has no Retry button, only Remove: upload the file again. The same goes for a
+  restart that comes between the upload and the worker's turn: the app empties `media/.tmp/`
+  when it starts, and the episode fails with "upload lost".
+- **MCP cannot upload,** a remote tool call has no file on your disk to send; use a link.
+- Only the admin UI's own pages can upload (the same-origin rule above); the file name and title
+  travel in request headers, so the access log shows `POST /ui/feeds/<slug>/upload` and
+  nothing about the file.
 
 ## Configuration
 
@@ -101,9 +127,10 @@ make smoke    # builds the image and smoke-tests it with Docker, as CI does
 
 `make smoke` runs `scripts/smoke.sh`: the container read-only with no capabilities, the
 image's healthcheck, the MCP tools and their annotations (`scripts/smoke_mcp.py`), the admin UI,
-a feed round trip, the public routes' answers, ffmpeg, and `docker stop` under 8 s with exit
-status 0. CI runs the tests with `REQUIRE_FFMPEG=1` (the static ffmpeg of the image) and the
-same smoke test, and pushes the image from `main` and from `v*` tags.
+a feed round trip, an uploaded file that becomes an episode, the public routes' answers,
+ffmpeg, and `docker stop` under 8 s with exit status 0. CI runs the tests with `REQUIRE_FFMPEG=1`
+(the static ffmpeg of the image) and the same smoke test, and pushes the image from `main` and
+from `v*` tags.
 
 ## License
 

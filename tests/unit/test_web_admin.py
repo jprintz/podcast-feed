@@ -1,15 +1,20 @@
+import asyncio
+import dataclasses
+import logging
 import re
 import threading
 from datetime import UTC, datetime
 from html.parser import HTMLParser
+from urllib.parse import quote
 
 import pytest
 from starlette.routing import Route
 from starlette.testclient import TestClient
 
-from podcast_feed.config import Settings
+from podcast_feed import service as service_module
+from podcast_feed.config import GIB, Settings
 from podcast_feed.db import Database
-from podcast_feed.service import MAX_ARTWORK_BYTES, Service
+from podcast_feed.service import MAX_ARTWORK_BYTES, MAX_UPLOAD_BYTES, Service
 from podcast_feed.storage import Storage
 from podcast_feed.web import create_web_app
 from podcast_feed.web_admin import admin_routes
@@ -30,9 +35,12 @@ def db():
 
 
 @pytest.fixture
-def storage(tmp_path):
+def storage(tmp_path, monkeypatch):
     store = Storage(tmp_path / "media")
     store.ensure_layout()
+    # Plenty of room whatever the machine running the tests has; a test that is about the
+    # floor sets its own.
+    monkeypatch.setattr(store, "free_bytes", lambda: 100 * GIB)
     return store
 
 
@@ -806,3 +814,292 @@ def test_service_calls_never_run_on_the_event_loop(svc, db):
     }  # fmt: skip
     assert loop_threads and spy.threads
     assert spy.threads.isdisjoint(loop_threads)
+
+
+# ------------------------------------------------------------------------------- uploads
+
+TOO_LARGE = "That file is over the 100 MB upload limit. Add it by link instead."
+
+
+def upload(client, body=b"audio", name="talk.mp3", feed="talks", **headers):
+    """An upload as the page's script sends it: the file as the body, its name in a header."""
+    sent = {"Sec-Fetch-Site": "same-origin", **headers}
+    if name is not None:
+        sent["X-Upload-Name"] = quote(name)
+    return client.post(f"/ui/feeds/{feed}/upload", content=body, headers=sent)
+
+
+def tmp_files(storage) -> list[str]:
+    return sorted(p.name for p in storage.tmp.iterdir())
+
+
+async def send_upload(svc, events) -> list[dict]:
+    """Call the web app with an upload whose body arrives as `events` (what the server hands the
+    app one by one: the TestClient sends the whole body in one piece). Returns what it sent back."""
+    sent = []
+    pending = list(events)
+
+    async def receive():
+        return pending.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/ui/feeds/talks/upload",
+        "raw_path": b"/ui/feeds/talks/upload",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"podcast.example.com"),
+            (b"sec-fetch-site", b"same-origin"),
+            (b"x-upload-name", b"talk.mp3"),
+        ],
+        "client": ("127.0.0.1", 1234),
+        "server": ("podcast.example.com", 443),
+    }
+    await create_web_app(svc)(scope, receive, send)
+    return sent
+
+
+def storage_size(svc) -> int:
+    """The size of the one episode's file waiting in media/.tmp/."""
+    (waiting,) = svc.list_episodes("talks")
+    return svc._storage.upload_ready(waiting.id).stat().st_size
+
+
+def finish_is_never_reached(svc, monkeypatch):
+    """finish_upload checks the size again, so a streaming limit that is gone would still be
+    caught there; with this the 413 has to come from the limit on what arrives."""
+
+    def finish(*args, **kwargs):
+        raise AssertionError("finish_upload was reached: the limit was not kept while receiving")
+
+    monkeypatch.setattr(svc, "finish_upload", finish)
+
+
+def test_an_upload_is_queued_as_an_episode(client, svc, storage, talks):
+    response = upload(client, b"audio bytes")
+    assert (response.status_code, response.content) == (204, b"")
+    e = episode_of(svc)
+    assert (e.status, e.source_kind, e.source_ref) == ("queued", "upload", f"{e.id}/talk.mp3")
+    assert e.title is None and tmp_files(storage) == [f"{e.id}.upload"]
+    assert storage.upload_ready(e.id).read_bytes() == b"audio bytes"
+
+
+def test_the_title_and_the_name_arrive_percent_encoded(client, svc, talks):
+    response = upload(
+        client, name="Ångest på kvällen.mp3", **{"X-Upload-Title": quote("Kväll: två")}
+    )
+    assert response.status_code == 204
+    e = episode_of(svc)
+    assert e.title == "Kväll: två" and e.source_ref == f"{e.id}/Ångest på kvällen.mp3"
+
+
+def test_an_upload_without_a_name_still_works(client, svc, talks):
+    assert upload(client, name=None).status_code == 204
+    e = episode_of(svc)
+    assert e.source_ref == e.id
+
+
+def test_the_answers_are_not_cached_and_cannot_be_framed(client, talks):
+    for response in (upload(client), upload(client, body=b""), upload(client, feed="nope")):
+        assert response.headers["cache-control"] == "no-store"
+        assert response.headers["x-frame-options"] == "DENY"
+        assert response.headers["x-content-type-options"] == "nosniff"
+
+
+async def test_an_upload_is_written_in_big_pieces_by_worker_threads(svc, talks, monkeypatch):
+    """No file work on the event loop, and not a thread hop per 64 KiB chunk."""
+    calls = []
+    real = asyncio.to_thread
+
+    async def spy(fn, *args, **kwargs):
+        calls.append((fn.__name__, len(args[0]) if fn.__name__ == "write" else None))
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", spy)
+    pieces = [{"type": "http.request", "body": b"x" * 65536, "more_body": True}] * 39  # 2.5 MiB
+    last = {"type": "http.request", "body": b"x" * 65536, "more_body": False}
+    sent = await send_upload(svc, [*pieces, last])
+    assert sent[0]["status"] == 204
+    file_work = [call for call in calls if call[0] in ("open", "write", "close")]
+    mib = 1024 * 1024
+    assert file_work == [
+        ("open", None),
+        ("write", mib),
+        ("write", mib),
+        ("write", mib // 2),
+        ("close", None),
+    ]
+    assert storage_size(svc) == 40 * 65536
+
+
+def test_errors_come_back_as_plain_text(client, talks):
+    response = upload(client, body=b"")
+    assert (response.status_code, response.text) == (400, "No file was sent.")
+    assert response.headers["content-type"].startswith("text/plain")
+
+
+def test_an_upload_to_an_unknown_feed(client, storage):
+    response = upload(client, feed="nope")
+    assert response.status_code == 404
+    assert response.text == "Unknown feed 'nope'. Call list_feeds for the slugs."
+    assert tmp_files(storage) == []
+
+
+def test_an_upload_is_refused_for_its_declared_size_before_it_is_read(client, svc, storage, talks):
+    response = upload(client, b"x", **{"Content-Length": str(MAX_UPLOAD_BYTES + 1)})
+    assert (response.status_code, response.text) == (413, TOO_LARGE)
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+def test_an_upload_that_turns_out_too_large_is_cut_off_and_leaves_nothing(
+    client, svc, storage, talks, monkeypatch
+):
+    monkeypatch.setattr(service_module, "MAX_UPLOAD_BYTES", 1000)
+    finish_is_never_reached(svc, monkeypatch)
+
+    def body():  # chunked: no Content-Length to go by
+        for _ in range(3):
+            yield b"x" * 400
+
+    response = upload(client, body=body())
+    assert (response.status_code, response.text) == (413, TOO_LARGE)
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+def test_a_content_length_that_lies_does_not_let_a_big_body_in(
+    client, svc, storage, talks, monkeypatch
+):
+    monkeypatch.setattr(service_module, "MAX_UPLOAD_BYTES", 1000)
+    finish_is_never_reached(svc, monkeypatch)
+    response = upload(client, b"x" * 2000, **{"Content-Length": "10"})
+    assert response.status_code == 413
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+def test_exactly_the_limit_is_taken(client, svc, talks, monkeypatch):
+    monkeypatch.setattr(service_module, "MAX_UPLOAD_BYTES", 1000)
+    assert upload(client, b"x" * 1000).status_code == 204
+    assert upload(client, b"x" * 1001).status_code == 413
+
+
+def test_an_upload_is_refused_when_the_disk_is_nearly_full(
+    client, svc, storage, talks, monkeypatch
+):
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB)
+    response = upload(client, b"audio")
+    assert response.status_code == 400 and "nearly out of disk space" in response.text
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+@pytest.mark.parametrize(
+    "headers", [{}, {"Sec-Fetch-Site": "cross-site"}, {"Origin": "https://evil.example"}]
+)
+def test_a_cross_site_upload_is_refused_and_nothing_is_stored(client, svc, storage, talks, headers):
+    response = client.post("/ui/feeds/talks/upload", content=b"audio", headers=headers)
+    assert response.status_code == 403 and response.text == "cross-site request refused\n"
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+def test_the_upload_route_answers_only_post(client, talks):
+    assert client.get("/ui/feeds/talks/upload").status_code == 405
+
+
+async def test_an_upload_that_is_cut_off_leaves_nothing(svc, storage, talks):
+    """The browser goes away halfway through the body (a closed tab, a lost connection)."""
+    await send_upload(
+        svc,
+        [
+            {"type": "http.request", "body": b"half of the file", "more_body": True},
+            {"type": "http.disconnect"},
+        ],
+    )
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+async def test_an_upload_that_is_cut_off_after_a_big_piece_leaves_nothing(svc, storage, talks):
+    """The same after some of the body has been written (the pieces go out in 1 MiB steps)."""
+    pieces = [{"type": "http.request", "body": b"x" * 65536, "more_body": True}] * 20
+    await send_upload(svc, [*pieces, {"type": "http.disconnect"}])
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+def test_an_upload_that_cannot_be_written_says_so_and_leaves_nothing(
+    client, svc, storage, talks, monkeypatch, caplog
+):
+    real = svc.start_upload
+
+    def unwritable(*args):
+        return dataclasses.replace(real(*args), part=storage.root / "gone" / "x.part")
+
+    monkeypatch.setattr(svc, "start_upload", unwritable)
+    with caplog.at_level(logging.INFO):
+        response = upload(client, b"audio", name="Diary.mp3")
+    assert (response.status_code, response.text) == (500, "The server could not save the upload.")
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+    assert "Diary" not in caplog.text
+
+
+def test_the_page_offers_the_upload_only_to_a_script(client, talks):
+    page = client.get("/ui/feeds/talks").text
+    assert re.search(r'<div id="upload-section" hidden data-feed-url="/ui/feeds/talks">', page)
+    assert 'aria-label="Upload progress"' in page
+    assert 'id="upload"' in page and 'data-action="/ui/feeds/talks/upload"' in page
+    assert f'data-max-bytes="{MAX_UPLOAD_BYTES}"' in page
+    assert f'data-too-large="{TOO_LARGE}"' in page
+    assert 'type="file"' in page and "up to 100 MB" in page
+    assert 'enctype="multipart/form-data"' not in page.split('id="upload"')[1].split("</form>")[0]
+    assert alerts(client.get("/ui/feeds/talks")) == []  # the script makes its own alert
+
+
+def test_the_script_sends_the_file_as_the_body_and_reports_progress(client):
+    script = client.get("/ui/static/app.js").text
+    for needle in (
+        "XMLHttpRequest",
+        "xhr.upload",
+        "X-Upload-Name",
+        "X-Upload-Title",
+        "upload-section",
+    ):
+        assert needle in script
+
+
+def test_an_upload_row_without_a_title_shows_the_file_name(client, svc, talks):
+    upload(client, name="Evening walk.mp3")
+    upload(client, name=None)
+    for text in (client.get("/ui/feeds/talks").text, client.get("/ui/feeds/talks/episodes").text):
+        assert "Evening walk.mp3" in text and "unknown source" not in text
+        assert '<span class="muted">upload</span>' in text
+
+
+def test_a_failed_upload_is_not_offered_a_retry(client, svc, db, talks):
+    upload(client)
+    e = episode_of(svc)
+    db.set_status(e.id, "failed", "upload lost")
+    fragment = client.get("/ui/feeds/talks/episodes").text
+    assert "Failed: upload lost" in fragment
+    assert "/retry" not in fragment and f'action="/ui/episodes/{e.id}/remove"' in fragment
+
+
+def test_retrying_an_upload_says_why_not(client, svc, db, talks):
+    upload(client)
+    e = episode_of(svc)
+    db.set_status(e.id, "failed", "upload lost")
+    response = post(client, f"/ui/episodes/{e.id}/retry")
+    assert response.status_code == 400
+    assert alerts(response) == ["An upload can't be retried; upload the file again."]
+
+
+def test_a_failed_link_is_still_offered_a_retry(client, svc, db, talks):
+    add(client)
+    upload(client)
+    db.set_status(episode_of(svc, 1).id, "failed", "timed out")
+    db.set_status(episode_of(svc, 0).id, "failed", "upload lost")
+    assert client.get("/ui/feeds/talks/episodes").text.count("/retry") == 1

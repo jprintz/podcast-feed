@@ -1,5 +1,6 @@
 import asyncio
 import dataclasses
+import sqlite3
 import threading
 import time
 import xml.etree.ElementTree as ET
@@ -7,10 +8,11 @@ from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
+from podcast_feed import service as service_module
 from podcast_feed.config import GIB, Settings
 from podcast_feed.db import Database, Episode
-from podcast_feed.errors import Invalid, NotFound
-from podcast_feed.service import FeedSummary, Service
+from podcast_feed.errors import Invalid, NotFound, TooLarge
+from podcast_feed.service import MAX_UPLOAD_BYTES, FeedSummary, Service
 from podcast_feed.storage import Storage
 
 URL = "https://x.example/a.mp3"
@@ -27,9 +29,12 @@ def db():
 
 
 @pytest.fixture
-def storage(tmp_path):
+def storage(tmp_path, monkeypatch):
     store = Storage(tmp_path / "media")
     store.ensure_layout()
+    # Plenty of room whatever the machine running the tests has; a test that is about the
+    # floor sets its own.
+    monkeypatch.setattr(store, "free_bytes", lambda: 100 * GIB)
     return store
 
 
@@ -1041,3 +1046,190 @@ def test_the_public_methods_never_leak_the_secret_in_errors(svc):
         with pytest.raises(NotFound) as exc:
             call()
         assert "s3cr3t" not in str(exc.value)
+
+
+# ------------------------------------------------------------------------------- uploads
+
+
+def receive(svc, body=b"audio", filename="talk.mp3", feed=None, declared=None):
+    """What the admin UI does with an upload: start, write the body, finish."""
+    pending = svc.start_upload(feed, filename, len(body) if declared is None else declared)
+    pending.part.write_bytes(body)
+    return pending
+
+
+def tmp_files(storage) -> list[str]:
+    return sorted(p.name for p in storage.tmp.iterdir())
+
+
+def test_an_upload_is_queued_under_its_own_id(svc, storage, wakes):
+    svc.create_feed("Talks")
+    pending = receive(svc, filename="C:\\Music\\Talk One.mp3")
+    assert tmp_files(storage) == [f"{pending.id}.part"] and wakes == []  # not yet an episode
+    e = svc.finish_upload(pending, "  Mine ", "About it")
+    assert e.id == pending.id and (e.status, e.source_kind) == ("queued", "upload")
+    assert e.source_ref == f"{pending.id}/Talk One.mp3"
+    assert (e.title, e.description, e.feed_slug) == ("Mine", "About it", "talks")
+    assert tmp_files(storage) == [f"{pending.id}.upload"] and wakes == [None]
+    assert storage.upload_ready(pending.id).read_bytes() == b"audio"
+    assert svc.get_episode(e.id) == e
+
+
+def test_the_same_file_uploaded_twice_is_two_episodes(svc, wakes):
+    svc.create_feed("Talks")
+    a = svc.finish_upload(receive(svc))
+    b = svc.finish_upload(receive(svc))
+    assert a.id != b.id and len(svc.list_episodes()) == 2 and wakes == [None, None]
+
+
+def test_an_upload_goes_to_the_named_feed_or_the_default(svc):
+    svc.create_feed("Talks")
+    svc.create_feed("B")
+    assert svc.finish_upload(receive(svc)).feed_slug == "talks"
+    assert svc.finish_upload(receive(svc, feed="b")).feed_slug == "b"
+
+
+def test_an_upload_needs_a_feed(svc, storage):
+    with pytest.raises(Invalid, match="No feeds yet"):
+        svc.start_upload(None, "a.mp3", 5)
+    svc.create_feed("Talks")
+    with pytest.raises(NotFound, match="Unknown feed 'nope'"):
+        svc.start_upload("nope", "a.mp3", 5)
+    assert tmp_files(storage) == []
+
+
+def test_a_declared_size_over_the_limit_is_refused_before_anything_is_written(svc, storage):
+    svc.create_feed("Talks")
+    with pytest.raises(TooLarge) as exc:
+        svc.start_upload(None, "a.mp3", MAX_UPLOAD_BYTES + 1)
+    assert str(exc.value) == "That file is over the 100 MB upload limit. Add it by link instead."
+    assert tmp_files(storage) == []
+    svc.start_upload(None, "a.mp3", MAX_UPLOAD_BYTES)  # exactly the limit fits
+    svc.start_upload(None, "a.mp3", None)  # no Content-Length: counted while it arrives
+
+
+def test_an_upload_is_refused_when_the_disk_would_fall_below_the_floor(svc, storage, monkeypatch):
+    svc.create_feed("Talks")
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + 1000 - 1)
+    with pytest.raises(Invalid) as exc:
+        svc.start_upload(None, "a.mp3", 1000)
+    assert (
+        str(exc.value)
+        == "The server is nearly out of disk space, so it cannot take the upload now."
+    )
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + 1000)
+    svc.start_upload(None, "a.mp3", 1000)
+
+
+def test_an_empty_upload_is_refused_and_leaves_nothing(svc, storage, wakes):
+    svc.create_feed("Talks")
+    with pytest.raises(Invalid) as exc:
+        svc.finish_upload(receive(svc, body=b""))
+    assert str(exc.value) == "No file was sent."
+    assert tmp_files(storage) == [] and svc.list_episodes() == [] and wakes == []
+
+
+def test_an_upload_that_grew_past_the_limit_is_refused_and_leaves_nothing(svc, storage, wakes):
+    svc.create_feed("Talks")
+    pending = svc.start_upload(None, "a.mp3", None)
+    with pending.part.open("wb") as part:
+        part.truncate(MAX_UPLOAD_BYTES + 1)  # a sparse file: no 100 MB written
+    with pytest.raises(TooLarge):
+        svc.finish_upload(pending)
+    assert tmp_files(storage) == [] and svc.list_episodes() == [] and wakes == []
+
+
+def test_an_upload_whose_feed_was_deleted_meanwhile_leaves_nothing(svc, storage, wakes):
+    svc.create_feed("Talks")
+    svc.create_feed("B")
+    pending = receive(svc, feed="b")
+    svc.delete_feed("b")
+    with pytest.raises(NotFound, match="Unknown feed 'b'"):
+        svc.finish_upload(pending)
+    assert tmp_files(storage) == [] and wakes == []
+
+
+def test_an_aborted_upload_leaves_nothing(svc, storage):
+    svc.create_feed("Talks")
+    svc.abort_upload(receive(svc))
+    assert tmp_files(storage) == []
+    svc.abort_upload(receive(svc))  # nothing to clean up twice
+
+
+def test_a_failed_upload_cannot_be_retried(svc, db, storage, wakes):
+    svc.create_feed("Talks")
+    e = svc.finish_upload(receive(svc))
+    wakes.clear()
+    with pytest.raises(Invalid, match="Only failed"):  # not failed yet
+        svc.retry_episode(e.id)
+    db.set_status(e.id, "failed", "upload lost")
+    with pytest.raises(Invalid) as exc:
+        svc.retry_episode(e.id)
+    assert str(exc.value) == "An upload can't be retried; upload the file again."
+    assert svc.get_episode(e.id).status == "failed" and wakes == []
+
+
+def test_removing_an_upload_that_waits_takes_its_file(svc, storage):
+    svc.create_feed("Talks")
+    e = svc.finish_upload(receive(svc))
+    svc.remove_episode(e.id)
+    assert tmp_files(storage) == [] and svc.list_episodes() == []
+
+
+def test_removing_an_episode_leaves_the_files_of_other_uploads(svc, storage):
+    svc.create_feed("Talks")
+    keep = svc.finish_upload(receive(svc))
+    gone = svc.finish_upload(receive(svc))
+    svc.remove_episode(gone.id)
+    assert tmp_files(storage) == [f"{keep.id}.upload"]
+
+
+def test_deleting_a_feed_takes_the_files_of_its_waiting_uploads(svc, db, storage):
+    svc.create_feed("Talks")
+    svc.create_feed("B")
+    waiting = svc.finish_upload(receive(svc, feed="talks"))
+    assert storage.upload_ready(waiting.id).exists()
+    failed = svc.finish_upload(receive(svc, feed="talks"))
+    db.set_status(failed.id, "failed", "not an audio or video file")
+    storage.upload_ready(failed.id).unlink()  # the worker deletes it when its job ends
+    other = svc.finish_upload(receive(svc, feed="b"))
+    unfinished = receive(svc, feed="talks")  # still arriving: not an episode yet
+    svc.delete_feed("talks")
+    assert tmp_files(storage) == sorted([f"{other.id}.upload", f"{unfinished.id}.part"])
+    assert [e.id for e in svc.list_episodes()] == [other.id]
+    assert not storage.upload_ready(waiting.id).exists()
+
+
+def test_a_feed_with_a_waiting_upload_is_deleted_even_if_the_folder_cannot_be(
+    svc, storage, monkeypatch
+):
+    svc.create_feed("Talks")
+    e = svc.finish_upload(receive(svc))
+
+    def boom(slug):
+        raise OSError("disk on fire")
+
+    monkeypatch.setattr(storage, "delete_feed", boom)
+    with pytest.raises(OSError):
+        svc.delete_feed("talks")
+    assert not storage.upload_ready(e.id).exists()  # the upload's file went with its row
+    assert svc.list_feeds() == []
+
+
+def test_an_upload_of_unknown_size_reserves_room_for_the_whole_limit(svc, storage, monkeypatch):
+    svc.create_feed("Talks")
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + MAX_UPLOAD_BYTES - 1)
+    with pytest.raises(Invalid, match="nearly out of disk space"):
+        svc.start_upload(None, "a.mp3", None)
+    svc.start_upload(None, "a.mp3", 1000)  # a known, small size still fits
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + MAX_UPLOAD_BYTES)
+    svc.start_upload(None, "a.mp3", None)
+
+
+def test_an_id_that_is_taken_is_not_taken_for_a_deleted_feed(svc, monkeypatch):
+    """Only the feed's foreign key means the feed is gone; any other constraint is a bug."""
+    svc.create_feed("Talks")
+    monkeypatch.setattr(service_module, "new_episode_id", lambda: "abcdefghijkl")
+    svc.finish_upload(receive(svc, filename="one.mp3"))
+    with pytest.raises(sqlite3.IntegrityError):  # another source, the same id
+        svc.finish_upload(receive(svc, filename="two.mp3"))

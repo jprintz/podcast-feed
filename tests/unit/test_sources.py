@@ -10,7 +10,16 @@ import pytest
 from podcast_feed import __version__
 from podcast_feed.errors import EpisodeFailure
 from podcast_feed.guard import guarded_client
-from podcast_feed.sources import Fetched, HttpFileSource, filename_from
+from podcast_feed.sources import (
+    Fetched,
+    HttpFileSource,
+    UploadSource,
+    filename_from,
+    upload_filename,
+    upload_id,
+    upload_ref,
+)
+from podcast_feed.storage import Storage
 
 MAX_BYTES = 1000
 WEB_PAGE = "that link is a web page, not an audio or video file"
@@ -698,3 +707,63 @@ async def test_a_redirect_to_a_private_address_is_blocked_before_any_request(
     assert str(info.value) == "blocked address"
     assert redirect_server.requests == ["GET /start HTTP/1.1"]  # /secret was never asked for
     assert not dest.exists()
+
+
+# ------------------------------------------------------------------------------------ uploads
+
+
+def test_an_upload_ref_holds_the_episode_id_and_the_clean_file_name():
+    ref = upload_ref("abcdefghijkl", "C:\\Users\\me\\Talk\x07 One.mp3")
+    assert ref == "abcdefghijkl/Talk One.mp3"
+    assert upload_id(ref) == "abcdefghijkl" and upload_filename(ref) == "Talk One.mp3"
+
+
+@pytest.mark.parametrize("name", [None, "", "  ", "..", "a/"])
+def test_an_upload_without_a_usable_name_has_the_id_alone_as_ref(name):
+    ref = upload_ref("abcdefghijkl", name)
+    assert ref == "abcdefghijkl"
+    assert upload_id(ref) == "abcdefghijkl" and upload_filename(ref) is None
+
+
+def test_a_very_long_upload_name_is_cut():
+    ref = upload_ref("abcdefghijkl", "x" * 1000 + ".mp3")
+    assert len(upload_filename(ref)) == 200
+
+
+@pytest.fixture
+def uploads(tmp_path):
+    storage = Storage(tmp_path / "media")
+    storage.ensure_layout()
+    return storage
+
+
+async def test_the_upload_source_moves_the_ready_file_to_dest(uploads, tmp_path):
+    uploads.upload_ready("abcdefghijkl").write_bytes(b"audio")
+    dest = tmp_path / "dl"
+    fetched = await UploadSource(uploads).fetch("abcdefghijkl/Talk.mp3", dest)
+    assert fetched == Fetched(dest, "Talk.mp3", "upload")
+    assert dest.read_bytes() == b"audio" and not uploads.upload_ready("abcdefghijkl").exists()
+
+
+async def test_the_upload_source_without_a_name(uploads, tmp_path):
+    uploads.upload_ready("abcdefghijkl").write_bytes(b"audio")
+    fetched = await UploadSource(uploads).fetch("abcdefghijkl", tmp_path / "dl")
+    assert fetched.filename is None
+
+
+async def test_a_lost_upload_fails_with_a_reason_and_leaves_no_dest(uploads, tmp_path):
+    dest = tmp_path / "dl"
+    with pytest.raises(EpisodeFailure) as info:
+        await UploadSource(uploads).fetch("abcdefghijkl/Talk.mp3", dest)
+    assert str(info.value) == "upload lost" and not dest.exists()
+
+
+async def test_the_part_of_an_unfinished_upload_is_never_taken(uploads, tmp_path):
+    uploads.upload_part("abcdefghijkl").write_bytes(b"half")
+    with pytest.raises(EpisodeFailure):
+        await UploadSource(uploads).fetch("abcdefghijkl", tmp_path / "dl")
+    assert uploads.upload_part("abcdefghijkl").read_bytes() == b"half"
+
+
+def test_the_upload_source_kind():
+    assert UploadSource.kind == "upload"

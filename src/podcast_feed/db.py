@@ -288,20 +288,34 @@ class Database:
             conn.execute("UPDATE feeds SET is_default = 0 WHERE is_default = 1")
             conn.execute("UPDATE feeds SET is_default = 1 WHERE id = ?", (row["id"],))
 
-    def delete_feed(self, slug: str) -> None:
-        """Delete the feed and, by cascade, its episodes. The files are the caller's to remove."""
+    def delete_feed(self, slug: str) -> list[str]:
+        """Delete the feed and, by cascade, its episodes. The files are the caller's to remove.
+
+        Returns the ids of the episodes the worker had not finished (queued, or being processed),
+        read in the same transaction: an upload that waits has a file in media/.tmp/ that no
+        episode row names any more once this returns.
+        """
         with self._tx() as conn:
             row = conn.execute(
                 "SELECT id, is_default FROM feeds WHERE slug = ?", (slug,)
             ).fetchone()
             if row is None:
                 raise _no_feed(slug)
+            unfinished = [
+                r["id"]
+                for r in conn.execute(
+                    "SELECT id FROM episodes WHERE feed_id = ?"
+                    " AND status IN ('queued', 'downloading', 'converting')",
+                    (row["id"],),
+                )
+            ]
             conn.execute("DELETE FROM feeds WHERE id = ?", (row["id"],))
             if row["is_default"]:
                 conn.execute(
                     "UPDATE feeds SET is_default = 1"
                     " WHERE id = (SELECT id FROM feeds ORDER BY created_at, id LIMIT 1)"
                 )
+            return unfinished
 
     def ready_counts(self) -> dict[int, int]:
         """Ready episodes per feed id; a feed without any counts 0."""
@@ -322,15 +336,28 @@ class Database:
         source_ref: str,
         title: str | None,
         description: str | None,
+        episode_id: str | None = None,
     ) -> tuple[Episode, bool]:
-        """The episode for this source in this feed, and whether this call created it."""
+        """The episode for this source in this feed, and whether this call created it.
+
+        A new episode gets a fresh id, or `episode_id` when the caller made the files it will
+        process under that name already (an upload).
+        """
         now = _ts(self._clock())
         with self._tx() as conn:
             cursor = conn.execute(
                 "INSERT INTO episodes (id, feed_id, source_kind, source_ref, title, description,"
                 " status, added_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)"
                 " ON CONFLICT (feed_id, source_kind, source_ref) DO NOTHING",
-                (new_episode_id(), feed_id, source_kind, source_ref, title, description, now),
+                (
+                    episode_id or new_episode_id(),
+                    feed_id,
+                    source_kind,
+                    source_ref,
+                    title,
+                    description,
+                    now,
+                ),
             )
             row = conn.execute(
                 f"{_EPISODE} WHERE e.feed_id = ? AND e.source_kind = ? AND e.source_ref = ?",

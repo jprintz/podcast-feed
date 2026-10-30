@@ -2,7 +2,7 @@
 
     media/
       CACHEDIR.TAG     keeps media/ out of backups (restic --exclude-caches)
-      .tmp/            downloads and conversions in progress
+      .tmp/            downloads, uploads and conversions in progress
       <slug>/          a feed's audio, episode artwork and cover
 
 .tmp/ is on the same file system as the feed folders, so a finished file moves into its feed
@@ -53,6 +53,19 @@ class Storage:
                 shutil.rmtree(entry)
             else:
                 entry.unlink(missing_ok=True)
+
+    def upload_part(self, episode_id: str) -> Path:
+        """Where an upload is written while it arrives (.tmp/<id>.part). Nothing reads it."""
+        return self.tmp / f"{_plain_name(episode_id)}.part"
+
+    def upload_ready(self, episode_id: str) -> Path:
+        """Where a complete upload waits for the worker (.tmp/<id>.upload)."""
+        return self.tmp / f"{_plain_name(episode_id)}.upload"
+
+    def delete_upload(self, episode_id: str) -> None:
+        """Delete the upload's files, whichever exist: both of an episode's uploads are one."""
+        self.upload_part(episode_id).unlink(missing_ok=True)
+        self.upload_ready(episode_id).unlink(missing_ok=True)
 
     def feed_dir(self, slug: str) -> Path:
         """The feed's folder, which may not exist yet. Invalid unless slug is a feed slug."""

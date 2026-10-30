@@ -220,6 +220,17 @@ def test_retention_must_be_at_least_one_day(db):
 # ------------------------------------------------------------- episodes
 
 
+def test_an_episode_can_be_added_under_an_id_of_the_callers(db):
+    f = db.create_feed("talks", "Talks")
+    e, created = db.add_or_get_episode(f.id, "upload", "abcdefghijkl", None, None, "abcdefghijkl")
+    assert created and e.id == "abcdefghijkl" and db.get_episode("abcdefghijkl") == e
+    # Another id, the same source: the first one stays (a link is one episode per feed).
+    again, created = db.add_or_get_episode(
+        f.id, "upload", "abcdefghijkl", None, None, "mnopqrstuvwx"
+    )
+    assert not created and again.id == "abcdefghijkl"
+
+
 def test_add_or_get_episode_dedupes(db):
     f = db.create_feed("a", "A")
     e1, c1 = db.add_or_get_episode(f.id, "url", "https://x/y.mp3", None, None)
@@ -536,6 +547,23 @@ def test_delete_feed_cascades(db):
     db.delete_feed("a")
     assert [e.id for e in db.list_episodes()] == [keep.id]
     assert db.get_feed("a") is None
+
+
+def test_delete_feed_returns_the_episodes_the_worker_had_not_finished(db):
+    a = db.create_feed("a", "A")
+    b = db.create_feed("b", "B")
+    unfinished = []
+    for status in ("queued", "downloading", "converting", "failed", "ready"):
+        e, _ = db.add_or_get_episode(a.id, "upload", f"{status}/x.mp3", None, None, status)
+        if status != "queued":
+            db.set_status(e.id, status)
+        if status in ("queued", "downloading", "converting"):
+            unfinished.append(e.id)
+    link, _ = db.add_or_get_episode(a.id, "url", "https://x/1", None, None)
+    unfinished.append(link.id)
+    db.add_or_get_episode(b.id, "upload", "other/x.mp3", None, None, "other")  # another feed's
+    assert sorted(db.delete_feed("a")) == sorted(unfinished)
+    assert [e.id for e in db.list_episodes()] == ["other"]
 
 
 def test_ready_counts(db):

@@ -20,7 +20,8 @@
                 <p><button type="submit">Save</button></p>
               </form>
             </details>
-            {% if episode.status == "failed" %}
+            {# An upload's file is deleted when its job ends, so there is nothing to retry. #}
+            {% if episode.status == "failed" and episode.source_kind != "upload" %}
             <form method="post" action="/ui/episodes/{{ episode.id }}/retry"><button type="submit">Retry</button></form>
             {% endif %}
             <form method="post" action="/ui/episodes/{{ episode.id }}/remove"><button type="submit" data-confirm="Remove this episode and its files?">Remove</button></form>

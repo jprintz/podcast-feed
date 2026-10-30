@@ -3,8 +3,8 @@
 #     scripts/smoke.sh IMAGE
 # The container runs as in production: read-only root, no capabilities, uid 65532, /data and
 # /media on tmpfs. Checked: the image's healthcheck, the MCP tools and their annotations, the
-# admin UI and its static files, a feed round trip, the public routes' answers, ffmpeg and
-# ffprobe, a log without the public base, and that `docker stop` (SIGTERM) ends the process by
+# admin UI and its static files, a feed round trip, an uploaded file that becomes an episode,
+# the public routes' answers, ffmpeg and ffprobe, a log without the public base, and that `docker stop` (SIGTERM) ends the process by
 # itself within 8 s.
 # The container is always removed; its log is printed when a check fails.
 set -euo pipefail
@@ -100,6 +100,27 @@ expect 303 GET /
 # The admin UI's static files come from the installed wheel.
 expect 200 GET /ui/static/htmx.min.js
 [[ $(head -n 1 "$tmp/body") == '/*'* ]] || fail "GET /ui/static/htmx.min.js: unexpected body"
+
+# An upload round trip: the file is the body of a request, the app (uid 65532, read-only root)
+# writes it to /media/.tmp, the image's ffmpeg converts it and the feed publishes it. The file is
+# made in the container (/tmp is writable) and read out through `cat`: the image has no shell.
+docker exec "$name" ffmpeg -nostdin -v error -f lavfi -i sine=duration=1 -c:a aac -b:a 128k \
+  -f ipod -y /tmp/upload.m4a
+docker exec "$name" cat /tmp/upload.m4a >"$tmp/upload.m4a"
+docker exec "$name" rm /tmp/upload.m4a
+expect 204 POST /ui/feeds/smoke/upload -H 'Sec-Fetch-Site: same-origin' \
+  -H 'X-Upload-Name: tone.m4a' --data-binary "@$tmp/upload.m4a"
+episode=
+for _ in $(seq 1 30); do
+  curl -fsS "http://$web/feeds/smoke.xml" >"$tmp/feed"
+  episode=$(sed -n 's/.*<enclosure url="\([^"]*\)".*/\1/p' "$tmp/feed" | head -n 1)
+  [ -n "$episode" ] && break
+  sleep 1
+done
+[ -n "$episode" ] || fail "the uploaded file is not an episode of the feed after 30 s"
+[[ $episode == "$public_base"/media/smoke/* ]] || fail "the episode's audio link is unexpected"
+expect 200 GET "${episode#"$public_base"}"
+echo "ok: an uploaded file became an episode"
 
 # SIGTERM: the process must stop by itself (exit status 0), well before Docker's 10 s
 # timeout would kill it (137).

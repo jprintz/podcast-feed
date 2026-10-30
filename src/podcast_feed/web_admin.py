@@ -65,6 +65,8 @@ REFUSED = "cross-site request refused\n"
 # What the worker is still busy with: the table refreshes itself until none is left.
 UNFINISHED = ("queued", "downloading", "converting")
 CONFIRM_DELETE = "To delete the feed, type its slug ('{slug}') in the box."
+# How much of an upload is gathered before it is written (see _receive).
+UPLOAD_WRITE_BYTES = 1024 * 1024
 
 _SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _STATUS_WORDS = {
@@ -209,15 +211,31 @@ def _declared_size(request: Request) -> int | None:
 
 
 async def _receive(request: Request, upload: PendingUpload) -> None:
-    """Write the request body to the upload's part file, never holding more than a chunk in
-    memory. TooLarge once more than `upload.limit` bytes have come, whatever Content-Length said."""
-    written = 0
-    with upload.part.open("wb") as part:
+    """Write the request body to the upload's part file. TooLarge once more than `upload.limit`
+    bytes have come, whatever Content-Length said.
+
+    The file work (open, write, close) runs in worker threads, never on the event loop, and the
+    chunks are gathered to about 1 MiB first, so that it is not a thread hop per 64 KiB. That is
+    all of the body that is held in memory.
+    """
+    part = await asyncio.to_thread(upload.part.open, "wb")
+    try:
+        written = 0
+        gathered: list[bytes] = []
+        gathered_bytes = 0
         async for chunk in request.stream():
             written += len(chunk)
             if written > upload.limit:
                 raise TooLarge(UPLOAD_TOO_LARGE)
-            part.write(chunk)
+            gathered.append(chunk)
+            gathered_bytes += len(chunk)
+            if gathered_bytes >= UPLOAD_WRITE_BYTES:
+                await asyncio.to_thread(part.write, b"".join(gathered))
+                gathered, gathered_bytes = [], 0
+        if gathered:
+            await asyncio.to_thread(part.write, b"".join(gathered))
+    finally:
+        await asyncio.to_thread(part.close)
 
 
 # ------------------------------------------------------------------------ what a page shows

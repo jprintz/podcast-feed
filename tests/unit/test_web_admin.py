@@ -1,3 +1,4 @@
+import asyncio
 import dataclasses
 import logging
 import re
@@ -832,6 +833,56 @@ def tmp_files(storage) -> list[str]:
     return sorted(p.name for p in storage.tmp.iterdir())
 
 
+async def send_upload(svc, events) -> list[dict]:
+    """Call the web app with an upload whose body arrives as `events` (what the server hands the
+    app one by one: the TestClient sends the whole body in one piece). Returns what it sent back."""
+    sent = []
+    pending = list(events)
+
+    async def receive():
+        return pending.pop(0)
+
+    async def send(message):
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": "POST",
+        "scheme": "https",
+        "path": "/ui/feeds/talks/upload",
+        "raw_path": b"/ui/feeds/talks/upload",
+        "query_string": b"",
+        "root_path": "",
+        "headers": [
+            (b"host", b"podcast.example.com"),
+            (b"sec-fetch-site", b"same-origin"),
+            (b"x-upload-name", b"talk.mp3"),
+        ],
+        "client": ("127.0.0.1", 1234),
+        "server": ("podcast.example.com", 443),
+    }
+    await create_web_app(svc)(scope, receive, send)
+    return sent
+
+
+def storage_size(svc) -> int:
+    """The size of the one episode's file waiting in media/.tmp/."""
+    (waiting,) = svc.list_episodes("talks")
+    return svc._storage.upload_ready(waiting.id).stat().st_size
+
+
+def finish_is_never_reached(svc, monkeypatch):
+    """finish_upload checks the size again, so a streaming limit that is gone would still be
+    caught there; with this the 413 has to come from the limit on what arrives."""
+
+    def finish(*args, **kwargs):
+        raise AssertionError("finish_upload was reached: the limit was not kept while receiving")
+
+    monkeypatch.setattr(svc, "finish_upload", finish)
+
+
 def test_an_upload_is_queued_as_an_episode(client, svc, storage, talks):
     response = upload(client, b"audio bytes")
     assert (response.status_code, response.content) == (204, b"")
@@ -863,6 +914,32 @@ def test_the_answers_are_not_cached_and_cannot_be_framed(client, talks):
         assert response.headers["x-content-type-options"] == "nosniff"
 
 
+async def test_an_upload_is_written_in_big_pieces_by_worker_threads(svc, talks, monkeypatch):
+    """No file work on the event loop, and not a thread hop per 64 KiB chunk."""
+    calls = []
+    real = asyncio.to_thread
+
+    async def spy(fn, *args, **kwargs):
+        calls.append((fn.__name__, len(args[0]) if fn.__name__ == "write" else None))
+        return await real(fn, *args, **kwargs)
+
+    monkeypatch.setattr(asyncio, "to_thread", spy)
+    pieces = [{"type": "http.request", "body": b"x" * 65536, "more_body": True}] * 39  # 2.5 MiB
+    last = {"type": "http.request", "body": b"x" * 65536, "more_body": False}
+    sent = await send_upload(svc, [*pieces, last])
+    assert sent[0]["status"] == 204
+    file_work = [call for call in calls if call[0] in ("open", "write", "close")]
+    mib = 1024 * 1024
+    assert file_work == [
+        ("open", None),
+        ("write", mib),
+        ("write", mib),
+        ("write", mib // 2),
+        ("close", None),
+    ]
+    assert storage_size(svc) == 40 * 65536
+
+
 def test_errors_come_back_as_plain_text(client, talks):
     response = upload(client, body=b"")
     assert (response.status_code, response.text) == (400, "No file was sent.")
@@ -886,6 +963,7 @@ def test_an_upload_that_turns_out_too_large_is_cut_off_and_leaves_nothing(
     client, svc, storage, talks, monkeypatch
 ):
     monkeypatch.setattr(service_module, "MAX_UPLOAD_BYTES", 1000)
+    finish_is_never_reached(svc, monkeypatch)
 
     def body():  # chunked: no Content-Length to go by
         for _ in range(3):
@@ -900,6 +978,7 @@ def test_a_content_length_that_lies_does_not_let_a_big_body_in(
     client, svc, storage, talks, monkeypatch
 ):
     monkeypatch.setattr(service_module, "MAX_UPLOAD_BYTES", 1000)
+    finish_is_never_reached(svc, monkeypatch)
     response = upload(client, b"x" * 2000, **{"Content-Length": "10"})
     assert response.status_code == 413
     assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
@@ -935,38 +1014,20 @@ def test_the_upload_route_answers_only_post(client, talks):
 
 async def test_an_upload_that_is_cut_off_leaves_nothing(svc, storage, talks):
     """The browser goes away halfway through the body (a closed tab, a lost connection)."""
-    app = create_web_app(svc)
-    sent = []
-    events = [
-        {"type": "http.request", "body": b"half of the file", "more_body": True},
-        {"type": "http.disconnect"},
-    ]
-
-    async def receive():
-        return events.pop(0)
-
-    async def send(message):
-        sent.append(message)
-
-    scope = {
-        "type": "http",
-        "asgi": {"version": "3.0"},
-        "http_version": "1.1",
-        "method": "POST",
-        "scheme": "https",
-        "path": "/ui/feeds/talks/upload",
-        "raw_path": b"/ui/feeds/talks/upload",
-        "query_string": b"",
-        "root_path": "",
-        "headers": [
-            (b"host", b"podcast.example.com"),
-            (b"sec-fetch-site", b"same-origin"),
-            (b"x-upload-name", b"talk.mp3"),
+    await send_upload(
+        svc,
+        [
+            {"type": "http.request", "body": b"half of the file", "more_body": True},
+            {"type": "http.disconnect"},
         ],
-        "client": ("127.0.0.1", 1234),
-        "server": ("podcast.example.com", 443),
-    }
-    await app(scope, receive, send)
+    )
+    assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
+
+
+async def test_an_upload_that_is_cut_off_after_a_big_piece_leaves_nothing(svc, storage, talks):
+    """The same after some of the body has been written (the pieces go out in 1 MiB steps)."""
+    pieces = [{"type": "http.request", "body": b"x" * 65536, "more_body": True}] * 20
+    await send_upload(svc, [*pieces, {"type": "http.disconnect"}])
     assert tmp_files(storage) == [] and svc.list_episodes("talks") == []
 
 

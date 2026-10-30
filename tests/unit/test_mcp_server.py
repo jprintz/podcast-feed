@@ -1,5 +1,6 @@
 """The MCP server, through an in-memory client: tools, results, errors and logging."""
 
+import asyncio
 import json
 import logging
 import re
@@ -11,7 +12,7 @@ from mcp import Client
 
 from podcast_feed.config import GIB, Settings
 from podcast_feed.db import Database
-from podcast_feed.mcp_server import INSTRUCTIONS, create_mcp
+from podcast_feed.mcp_server import INSTRUCTIONS, _run, create_mcp
 from podcast_feed.service import Service
 from podcast_feed.storage import Storage
 
@@ -33,6 +34,9 @@ EPISODE_KEYS = {"id", "feed", "title", "description", "status", "error", "added_
 FEED_KEYS = {"slug", "title", "description", "episode_count", "retention_days", "default"}
 # What the SDK puts in front of a failed tool's own message.
 PREFIX = "Error executing tool {}: "
+# Text an exception might carry from a link. It is a constant so that it is not a literal in the
+# source line of a frame (which a traceback shows).
+LEAK = "SECRETTOKEN link"
 LOG_LINE = re.compile(r"tool=(\w+) target=(\S+) outcome=(\S+) ms=\d+")
 
 
@@ -170,7 +174,8 @@ async def test_input_schemas(svc):
         assert set(add["properties"]) == {"url", "feed", "title", "description"}
         assert add["required"] == ["url"]
         assert set(tools["list_episodes"]["properties"]) == {"feed", "status", "limit"}
-        assert tools["list_episodes"]["properties"]["limit"]["default"] == 50
+        limit = tools["list_episodes"]["properties"]["limit"]
+        assert (limit["default"], limit["minimum"], limit["maximum"]) == (50, 1, 500)
         assert tools["list_episodes"].get("required", []) == []
         for name in ("get_episode", "remove_episode"):
             assert set(tools[name]["properties"]) == {"episode_id"}
@@ -323,6 +328,23 @@ async def test_list_episodes_limit(svc):
         assert len(everyone) == 60
 
 
+@pytest.mark.parametrize("limit", [0, -1, 501, 10**20])
+async def test_a_limit_outside_1_to_500_is_rejected(svc, limit):
+    async with Client(create_mcp(svc)) as c:
+        svc.create_feed("Talks")
+        svc.add_episode(URL)
+        text = error_text(await c.call_tool("list_episodes", {"limit": limit}))
+        assert "validation error" in text and "limit" in text  # the argument check, not a crash
+
+
+async def test_the_largest_limit_works(svc):
+    async with Client(create_mcp(svc)) as c:
+        svc.create_feed("Talks")
+        svc.add_episode(URL)
+        assert len(data(await c.call_tool("list_episodes", {"limit": 500}))["episodes"]) == 1
+        assert len(data(await c.call_tool("list_episodes", {"limit": 1}))["episodes"]) == 1
+
+
 async def test_list_episodes_result_is_structured(svc):
     async with Client(create_mcp(svc)) as c:
         svc.create_feed("Talks")
@@ -369,7 +391,6 @@ async def test_error_messages_are_the_services(svc):
             ("add_episode", {"url": "https://u:p@x.example/a"}, "Links with a username or"),
             ("add_episode", {"url": URL, "feed": "nope"}, unknown_feed),
             ("list_episodes", {"feed": "nope"}, unknown_feed),
-            ("list_episodes", {"limit": 0}, "The limit must be at least 1."),
             ("get_episode", {"episode_id": "zzzzzzzzzzzz"}, no_episode),
             ("remove_episode", {"episode_id": "zzzzzzzzzzzz"}, no_episode),
         ]
@@ -401,15 +422,28 @@ async def test_blank_and_padded_slugs(svc):
         assert got == added
 
 
-async def test_an_unexpected_error_is_a_tool_error_without_its_text(svc, monkeypatch):
+async def test_blank_and_padded_status_mean_any_or_that_status(svc):
+    async with Client(create_mcp(svc)) as c:
+        svc.create_feed("Talks")
+        added = data(await c.call_tool("add_episode", {"url": URL}))
+        for status in ("", "   ", None):
+            got = data(await c.call_tool("list_episodes", {"status": status}))["episodes"]
+            assert [e["id"] for e in got] == [added["id"]], status
+        got = data(await c.call_tool("list_episodes", {"status": " queued "}))["episodes"]
+        assert [e["id"] for e in got] == [added["id"]]
+        got = data(await c.call_tool("list_episodes", {"status": " failed "}))["episodes"]
+        assert got == []
+
+
+async def test_an_unexpected_error_is_just_an_internal_error_to_the_client(svc, monkeypatch):
     async with Client(create_mcp(svc)) as c:
 
         def boom():
-            raise RuntimeError(f"disk on fire at https://{HOST}/x")
+            raise RuntimeError(LEAK)
 
         monkeypatch.setattr(svc, "list_feeds", boom)
         text = error_text(await c.call_tool("list_feeds"))
-        assert "disk on fire" not in text and HOST not in text
+        assert text == PREFIX.format("list_feeds") + "internal error"
 
 
 # ------------------------------------------------------------------- no secret anywhere
@@ -446,6 +480,17 @@ async def test_no_secret_anywhere(svc, db, storage, caplog):
         assert all(needle not in text for text in seen), needle
         assert needle not in caplog.text, needle
     assert "Private talk" not in caplog.text
+
+
+async def test_a_link_in_the_status_stays_out_of_the_log(svc, caplog):
+    caplog.set_level(logging.DEBUG)
+    svc.create_feed("Talks")
+    status_url = f"https://{HOST}/{SECRET}/feeds/talks.xml?token=hunter2"
+    async with Client(create_mcp(svc)) as c:
+        assert (await c.call_tool("list_episodes", {"status": status_url})).is_error
+        assert (await c.call_tool("list_episodes", {"status": f" {status_url} "})).is_error
+    for leak in (HOST, SECRET, "hunter2", "feeds/talks"):
+        assert leak not in caplog.text, leak
 
 
 async def test_a_link_or_a_sentence_where_an_id_or_slug_belongs_stays_out_of_the_log(svc, caplog):
@@ -489,7 +534,8 @@ async def test_log_lines(svc, caplog):
         await c.call_tool("get_episode", {"episode_id": eid})
         await c.call_tool("add_episode", {"url": "ftp://x.example/a"})
         await c.call_tool("add_episode", {"url": URL, "feed": "nope"})
-        await c.call_tool("list_episodes", {"limit": -1})
+        # Rejected by the argument check, before the tool runs: no line from us.
+        assert (await c.call_tool("list_episodes", {"limit": -1})).is_error
 
     lines = mcp_lines(caplog)
     parsed = [LOG_LINE.fullmatch(line) for line in lines]
@@ -504,26 +550,82 @@ async def test_log_lines(svc, caplog):
         ("get_episode", eid, "error:NotFound"),
         ("add_episode", "-", "error:Invalid"),
         ("add_episode", "nope", "error:NotFound"),
-        ("list_episodes", "-", "error:Invalid"),
     ]
     joined = "\n".join(lines)
     for leak in (HOST, "hunter2", "Private", "queued", SECRET, "x.example"):
         assert leak not in joined, leak
 
 
-async def test_an_unexpected_error_is_logged_by_type_only(svc, caplog, monkeypatch):
+async def test_an_unexpected_error_is_logged_with_its_type_and_frames_only(
+    svc, caplog, monkeypatch
+):
     caplog.set_level(logging.DEBUG)
 
     def boom():
-        raise RuntimeError(f"https://{HOST}/oops")
+        raise RuntimeError(LEAK)
 
     monkeypatch.setattr(svc, "list_feeds", boom)
     async with Client(create_mcp(svc)) as c:
         assert (await c.call_tool("list_feeds")).is_error
     lines = mcp_lines(caplog)
-    assert [LOG_LINE.fullmatch(line).groups() for line in lines] == [
-        ("list_feeds", "-", "error:RuntimeError")
+    assert len(lines) == 1  # one record for the call, whatever the SDK logs besides
+    first, _, frames = lines[0].partition("\n")
+    assert LOG_LINE.fullmatch(first).groups() == ("list_feeds", "-", "error:RuntimeError")
+    assert 'File "' in frames and "in boom" in frames and "raise RuntimeError(LEAK)" in frames
+    # Nothing in the exception's message anywhere, from any logger, in any form.
+    assert "SECRETTOKEN" not in caplog.text
+    assert all("SECRETTOKEN" not in r.getMessage() for r in caplog.records)
+    assert all(
+        r.exc_info is None or "SECRETTOKEN" not in str(r.exc_info[1]) for r in caplog.records
+    )
+
+
+async def test_a_cancelled_call_is_logged_as_an_error(caplog):
+    caplog.set_level(logging.DEBUG)
+    running = threading.Event()
+    release = threading.Event()
+
+    def slow() -> dict:
+        running.set()
+        release.wait(10)
+        return {}
+
+    task = asyncio.create_task(_run("get_episode", "abc123", slow))
+    try:
+        await asyncio.to_thread(running.wait, 10)
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        release.set()
+    assert [LOG_LINE.fullmatch(line).groups() for line in mcp_lines(caplog)] == [
+        ("get_episode", "abc123", "error:CancelledError")
     ]
+
+
+@pytest.mark.parametrize(
+    "link",
+    [
+        "http://xn--a-ecp.ru/private-path?token=SECRETTOKEN",  # idna: decodes to a⒈, not allowed
+        "http://xn--/private-path?token=SECRETTOKEN",
+        "http://xn--9999999999.example/private-path?token=SECRETTOKEN",
+        "http://x.example/private-path?token=SECRETTOKEN\ud800",  # a lone surrogate
+    ],
+)
+async def test_a_link_idna_cannot_decode_is_refused_and_never_logged(svc, caplog, link):
+    caplog.set_level(logging.DEBUG)
+    svc.create_feed("Talks")
+    async with Client(create_mcp(svc)) as c:
+        text = error_text(await c.call_tool("add_episode", {"url": link}))
+    assert text == PREFIX.format("add_episode") + "Only http and https links to a file work."
+    lines = mcp_lines(caplog)
+    assert [LOG_LINE.fullmatch(line).groups() for line in lines] == [
+        ("add_episode", "-", "error:Invalid")
+    ]
+    everything = caplog.text + "\n".join(r.getMessage() for r in caplog.records)
+    for leak in ("a\u2488", "xn--", "SECRETTOKEN", "private-path", "9999999999"):
+        assert leak not in everything, leak
+    assert svc.list_episodes() == []
 
 
 # -------------------------------------------------------------------- threading

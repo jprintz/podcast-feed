@@ -52,22 +52,32 @@ def is_public_ip(ip: str) -> bool:
     )
 
 
-def check_url(url: str) -> str:
-    """The link, normalised, if it is an http or https link with a host and no credentials."""
+def _parts(url: str) -> tuple[str, str, int | None, bytes, str] | None:
+    """The scheme, host, port, userinfo and normalised form of the link; None if it does not parse.
+
+    Everything is read here because httpx decodes the host on access, and idna can fail then
+    as well as when the URL is built. Its errors are UnicodeErrors whose messages quote the host
+    label, so they are swallowed here and `check_url` raises its own, outside this handler,
+    which leaves no trace of them: the link must not reach a log through an exception.
+    """
     try:
         parsed = httpx.URL(url.strip())
-    except httpx.InvalidURL:
-        parsed = None
-    if (
-        parsed is None
-        or parsed.scheme not in ("http", "https")
-        or not parsed.host
-        or (parsed.port is not None and not 1 <= parsed.port <= 65535)
-    ):
+        return parsed.scheme, parsed.host, parsed.port, parsed.userinfo, str(parsed)
+    except (httpx.InvalidURL, UnicodeError):
+        return None
+
+
+def check_url(url: str) -> str:
+    """The link, normalised, if it is an http or https link with a host and no credentials."""
+    parts = _parts(url)
+    if parts is None:
         raise Invalid("Only http and https links to a file work.")
-    if parsed.userinfo:
+    scheme, host, port, userinfo, link = parts
+    if scheme not in ("http", "https") or not host or (port is not None and not 1 <= port <= 65535):
+        raise Invalid("Only http and https links to a file work.")
+    if userinfo:
         raise Invalid("Links with a username or password are not accepted.")
-    return str(parsed)
+    return link
 
 
 class GuardedBackend(httpcore.AsyncNetworkBackend):

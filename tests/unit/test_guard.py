@@ -36,11 +36,36 @@ def test_check_url_normalises():
         ("http://x.example:-1/y", "Only http and https"),
         ("http://x.example:0/y", "Only http and https"),
         ("https://user@x.example/y", "username or password"),
+        # idna fails on these, and its errors quote the host label (see the next test).
+        ("http://xn--a-ecp.ru/private-path?token=X", "Only http and https"),  # decodes to a⒈
+        ("http://xn--/", "Only http and https"),
+        ("http://xn--9999999999.example/", "Only http and https"),  # invalid A-label
+        ("http://xn--aa--.example/", "Only http and https"),  # A-label ending in a hyphen
+        ("http://a\u2488.example/", "Only http and https"),  # a codepoint idna does not allow
+        ("http://x.example/\ud800", "Only http and https"),  # a lone surrogate
     ],
 )
 def test_check_url_rejects(url, msg):
     with pytest.raises(Invalid, match=msg):
         check_url(url)
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        "http://xn--a-ecp.ru/private-path?token=SECRETTOKEN",
+        "http://xn--/SECRETTOKEN",
+        "http://xn--9999999999.example/SECRETTOKEN",
+        "http://x.example/SECRETTOKEN\ud800",
+        "http://xn--SECRETTOKEN.example/",
+    ],
+)
+def test_check_url_raises_nothing_but_its_own_message(url):
+    """Only Invalid, with a fixed message and no cause or context to quote the link."""
+    with pytest.raises(Invalid) as info:
+        check_url(url)
+    assert str(info.value) == "Only http and https links to a file work."
+    assert info.value.__cause__ is None and info.value.__context__ is None
 
 
 @pytest.mark.parametrize(

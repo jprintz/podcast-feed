@@ -262,7 +262,10 @@ async def test_redirect_to_ftp(make_source, tmp_path):
     assert not (tmp_path / "dl").exists()
 
 
-@pytest.mark.parametrize("url", ["ftp://x.example/f.mp3", "https://u:p@x.example/f.mp3", "nope"])
+@pytest.mark.parametrize(
+    "url",
+    ["ftp://x.example/f.mp3", "https://u:p@x.example/f.mp3", "nope", "http://xn--a-ecp.ru/f.mp3"],
+)
 async def test_first_link_goes_through_the_guard_too(make_source, tmp_path, url):
     def handler(request):
         raise AssertionError("no request may be made")

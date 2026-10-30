@@ -52,7 +52,7 @@ request: the author runs the admin UI and the MCP server behind Cloudflare Acces
 | `PODCAST_HOST` | `0.0.0.0` | The address both listeners bind |
 
 A missing or invalid setting stops the program at once with exit status 2; the message names
-the variable, never its value. podcast-feed never logs `PODCAST_PUBLIC_BASE` or a feed URL:
+the variable and never quotes `PODCAST_PUBLIC_BASE`. podcast-feed never logs it or a feed URL:
 the feed URLs appear only in the admin UI. `media/` gets a `CACHEDIR.TAG`, so backups that
 skip caches (`restic --exclude-caches`) leave the audio out.
 

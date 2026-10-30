@@ -84,9 +84,10 @@ def build(settings: Settings) -> App:
 class _Listener(uvicorn.Server):
     """A uvicorn server that leaves signals to `main` and is stopped through `should_exit`.
 
-    uvicorn's own `capture_signals` installs SIGINT and SIGTERM handlers with signal.signal and
-    raises the signal again after its shutdown. With two servers in one process the handlers
-    nest, and the worker kept running until Podman killed the container.
+    uvicorn's own `capture_signals` replaces the SIGINT and SIGTERM handlers with signal.signal
+    and raises the signal again after its shutdown. Two servers in one process would nest those
+    handlers and put them back out of order, and neither knows about the worker. So `main`
+    handles the signals, once, for the whole process.
     """
 
     @contextlib.contextmanager
@@ -202,7 +203,7 @@ def main() -> None:
     try:
         settings = Settings.from_env()
     except ConfigError as exc:
-        # Its message names the setting, never the value (PODCAST_PUBLIC_BASE is a secret).
+        # Its message names the setting and never quotes PODCAST_PUBLIC_BASE (a secret).
         print(f"podcast-feed: {exc}", file=sys.stderr)
         sys.exit(2)
     try:

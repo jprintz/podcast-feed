@@ -15,9 +15,9 @@ import pytest
 
 from podcast_feed import worker as worker_module
 from podcast_feed.config import GIB, Settings
-from podcast_feed.db import Database, Episode, Feed
+from podcast_feed.db import Database, Episode, Feed, new_episode_id
 from podcast_feed.errors import EpisodeFailure
-from podcast_feed.sources import Fetched
+from podcast_feed.sources import Fetched, UploadSource, upload_ref
 from podcast_feed.storage import Storage
 from podcast_feed.worker import Worker
 from tests.media import mp3_with_comment
@@ -84,7 +84,8 @@ class W:
         """A new worker; settings=... replaces the settings, the rest go to Worker()."""
         settings = kwargs.pop("settings", self.settings)
         options = {"clock": self.clock, "free_bytes": lambda: 100 * GIB, **kwargs}
-        self.worker = Worker(self.db, self.storage, settings, {"url": self.source}, **options)
+        sources = {"url": self.source, "upload": UploadSource(self.storage)}
+        self.worker = Worker(self.db, self.storage, settings, sources, **options)
         return self.worker
 
 
@@ -117,6 +118,18 @@ def add(w: W, ref: str = REF, title: str | None = None, description: str | None 
     episode, created = w.db.add_or_get_episode(w.feed.id, "url", ref, title, description)
     assert created
     return episode
+
+
+def uploaded(w: W, file: Path, name: str | None = "talk.mp3", title: str | None = None) -> Episode:
+    """An episode as the service queues an upload: the file ready in media/.tmp/, the row under
+    the id the file is named after."""
+    episode_id = new_episode_id()
+    shutil.copyfile(file, w.storage.upload_ready(episode_id))
+    e, created = w.db.add_or_get_episode(
+        w.feed.id, "upload", upload_ref(episode_id, name), title, None, episode_id
+    )
+    assert created and e.id == episode_id
+    return e
 
 
 def published(w: W, ref: str, *, artwork: bool = False) -> Episode:
@@ -295,6 +308,58 @@ async def test_job_clears_only_its_own_temp_files(w):
     await w.worker.process(e.id)
     assert status(w, e) == "failed"
     assert [p.name for p in w.storage.tmp.iterdir()] == ["zzzzzzzzzzzz.download"]
+
+
+async def test_an_upload_becomes_ready(w, media):
+    e = uploaded(w, media("mp3"))
+    await w.worker.process(e.id)
+    r = w.db.get_episode(e.id)
+    assert (r.status, r.mime, r.title, r.file) == ("ready", "audio/mpeg", "Tone", f"{e.id}.mp3")
+    assert r.error is None and feed_files(w) == [f"{e.id}.mp3"] and not any(w.storage.tmp.iterdir())
+
+
+async def test_an_upload_without_a_title_tag_is_named_after_its_file(w, ffmpeg_tools, tmp_path):
+    e = uploaded(w, mp3_with_comment(tmp_path, 10), name="Evening walk.mp3")
+    await w.worker.process(e.id)
+    assert w.db.get_episode(e.id).title == "Evening walk"
+
+
+async def test_an_upload_without_any_name_is_named_after_the_day(w, ffmpeg_tools, tmp_path):
+    e = uploaded(w, mp3_with_comment(tmp_path, 10), name=None)
+    await w.worker.process(e.id)
+    assert w.db.get_episode(e.id).title == "upload 2026-10-29"
+
+
+async def test_an_upload_that_is_not_media_fails_and_leaves_nothing(w, media):
+    e = uploaded(w, media("text"), name="notes.txt")
+    await w.worker.process(e.id)
+    r = w.db.get_episode(e.id)
+    assert (r.status, r.error) == ("failed", "not an audio or video file")
+    assert not any(w.storage.tmp.iterdir()) and feed_files(w) == []
+
+
+async def test_a_lost_upload_fails_as_lost(w, media):
+    e = uploaded(w, media("mp3"))
+    w.storage.upload_ready(e.id).unlink()  # a restart emptied media/.tmp/
+    await w.worker.process(e.id)
+    r = w.db.get_episode(e.id)
+    assert (r.status, r.error) == ("failed", "upload lost")
+
+
+async def test_an_upload_refused_for_the_disk_floor_leaves_no_file_behind(w, media):
+    w.rebuild(free_bytes=lambda: 1)
+    e = uploaded(w, media("mp3"))
+    await w.worker.process(e.id)
+    assert w.db.get_episode(e.id).error == "disk nearly full"
+    assert not any(w.storage.tmp.iterdir())
+
+
+async def test_the_log_names_the_episode_never_the_upload(w, media, caplog):
+    caplog.set_level(logging.DEBUG)
+    e = uploaded(w, media("mp3"), name="My private diary.mp3")
+    await w.worker.process(e.id)
+    assert any(e.id in r.getMessage() for r in caplog.records)
+    assert "diary" not in caplog.text and "private" not in caplog.text
 
 
 async def test_unexpected_error(w, caplog):

@@ -3,10 +3,10 @@
 It runs on the event loop next to the two web servers. The admin UI and the MCP tools add
 episodes from worker threads and then call `wake()`, which is safe from any thread.
 
-A job checks the disk floor, downloads into media/.tmp/ (`downloading`), inspects and converts
-(`converting`), then moves the audio and its cover into media/<slug>/ and publishes the
-episode (`ready`). A failure sets `failed` with its reason. The job's temporary files are
-always deleted. Log lines name the episode id and the outcome, never the link: a link can
+A job checks the disk floor, downloads into media/.tmp/ (`downloading`; an upload is already
+there and only moves), inspects and converts (`converting`), then moves the audio and its cover
+into media/<slug>/ and publishes the episode (`ready`). A failure sets `failed` with its reason.
+The job's temporary files, an upload's included, are always deleted. Log lines name the episode id and the outcome, never the link: a link can
 carry a private token.
 """
 

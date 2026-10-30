@@ -62,6 +62,7 @@ def test_build(tmp_path):
         with TestClient(app.web) as c:
             assert c.get("/ui/").status_code == 200
         assert (tmp_path / "data/podcast.sqlite").exists()
+        assert set(app.worker._sources) == {"url", "upload"}  # a link or an upload
     finally:
         asyncio.run(app.aclose())
 

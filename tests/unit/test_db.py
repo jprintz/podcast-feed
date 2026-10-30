@@ -220,6 +220,17 @@ def test_retention_must_be_at_least_one_day(db):
 # ------------------------------------------------------------- episodes
 
 
+def test_an_episode_can_be_added_under_an_id_of_the_callers(db):
+    f = db.create_feed("talks", "Talks")
+    e, created = db.add_or_get_episode(f.id, "upload", "abcdefghijkl", None, None, "abcdefghijkl")
+    assert created and e.id == "abcdefghijkl" and db.get_episode("abcdefghijkl") == e
+    # Another id, the same source: the first one stays (a link is one episode per feed).
+    again, created = db.add_or_get_episode(
+        f.id, "upload", "abcdefghijkl", None, None, "mnopqrstuvwx"
+    )
+    assert not created and again.id == "abcdefghijkl"
+
+
 def test_add_or_get_episode_dedupes(db):
     f = db.create_feed("a", "A")
     e1, c1 = db.add_or_get_episode(f.id, "url", "https://x/y.mp3", None, None)

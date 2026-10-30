@@ -220,3 +220,26 @@ def test_free_bytes(s, monkeypatch):
 
 def test_free_bytes_of_a_real_disk(s):
     assert s.free_bytes() > 0
+
+
+def test_upload_files_live_in_tmp_and_the_id_must_be_a_plain_name(s):
+    assert s.upload_part("abcdefghijkl") == s.tmp / "abcdefghijkl.part"
+    assert s.upload_ready("abcdefghijkl") == s.tmp / "abcdefghijkl.upload"
+    for bad in ("../x", "a/b", ".hidden", ""):
+        with pytest.raises(Invalid):
+            s.upload_part(bad)
+        with pytest.raises(Invalid):
+            s.upload_ready(bad)
+
+
+def test_delete_upload_takes_both_files_and_nothing_else(s):
+    (s.tmp / "abcdefghijkl.part").write_bytes(b"x")
+    (s.tmp / "abcdefghijkl.upload").write_bytes(b"x")
+    (s.tmp / "abcdefghijkl.download").write_bytes(b"x")  # the worker's, not an upload's
+    (s.tmp / "zzzzzzzzzzzz.upload").write_bytes(b"x")
+    s.delete_upload("abcdefghijkl")
+    assert sorted(path.name for path in s.tmp.iterdir()) == [
+        "abcdefghijkl.download",
+        "zzzzzzzzzzzz.upload",
+    ]
+    s.delete_upload("abcdefghijkl")  # already gone: fine

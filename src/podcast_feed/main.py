@@ -31,7 +31,7 @@ from podcast_feed.errors import ConfigError
 from podcast_feed.guard import guarded_client
 from podcast_feed.mcp_server import create_mcp
 from podcast_feed.service import Service
-from podcast_feed.sources import HttpFileSource
+from podcast_feed.sources import HttpFileSource, UploadSource
 from podcast_feed.storage import Storage
 from podcast_feed.web import create_web_app
 from podcast_feed.worker import Worker
@@ -72,7 +72,8 @@ def build(settings: Settings) -> App:
     db = Database(settings.data_dir / "podcast.sqlite")
     storage = Storage(settings.media_dir)
     http = guarded_client()
-    worker = Worker(db, storage, settings, {"url": HttpFileSource(http, settings.max_bytes)})
+    sources = {"url": HttpFileSource(http, settings.max_bytes), "upload": UploadSource(storage)}
+    worker = Worker(db, storage, settings, sources)
     service = Service(db, storage, settings, wake=worker.wake)
     # host="0.0.0.0" is not the address the MCP server binds (that is settings.host, see
     # serve). The SDK switches its DNS-rebinding Host check on only for a localhost host, and

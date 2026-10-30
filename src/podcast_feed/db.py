@@ -322,15 +322,28 @@ class Database:
         source_ref: str,
         title: str | None,
         description: str | None,
+        episode_id: str | None = None,
     ) -> tuple[Episode, bool]:
-        """The episode for this source in this feed, and whether this call created it."""
+        """The episode for this source in this feed, and whether this call created it.
+
+        A new episode gets a fresh id, or `episode_id` when the caller made the files it will
+        process under that name already (an upload).
+        """
         now = _ts(self._clock())
         with self._tx() as conn:
             cursor = conn.execute(
                 "INSERT INTO episodes (id, feed_id, source_kind, source_ref, title, description,"
                 " status, added_at) VALUES (?, ?, ?, ?, ?, ?, 'queued', ?)"
                 " ON CONFLICT (feed_id, source_kind, source_ref) DO NOTHING",
-                (new_episode_id(), feed_id, source_kind, source_ref, title, description, now),
+                (
+                    episode_id or new_episode_id(),
+                    feed_id,
+                    source_kind,
+                    source_ref,
+                    title,
+                    description,
+                    now,
+                ),
             )
             row = conn.execute(
                 f"{_EPISODE} WHERE e.feed_id = ? AND e.source_kind = ? AND e.source_ref = ?",

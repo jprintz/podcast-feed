@@ -1,12 +1,17 @@
-"""Where episode files come from. A source downloads a link to disk and says what it got.
+"""Where episode files come from. A source puts a file at a path on disk and says what it got.
 
-`HttpFileSource` is the only one so far: it follows redirects itself, so that the guard
-checks every hop, and it refuses web pages and files over the size limit before they fill
-the disk. The whole download has a time limit too: httpx's timeouts are per read, and a server
-that sends a byte now and then would hold the (single) worker for ever.
+`HttpFileSource` downloads a link: it follows redirects itself, so that the guard checks
+every hop, and it refuses web pages and files over the size limit before they fill the disk.
+The whole download has a time limit too: httpx's timeouts are per read, and a server that
+sends a byte now and then would hold the (single) worker for ever.
+
+`UploadSource` takes a file the admin UI received: it is in media/.tmp/ already, so the
+"download" is a move. Its source reference is the episode's id and the file's name, see
+`upload_ref`.
 """
 
 import asyncio
+import os
 import unicodedata
 import urllib.parse
 from dataclasses import dataclass
@@ -20,8 +25,12 @@ import httpx
 from podcast_feed import __version__
 from podcast_feed.errors import EpisodeFailure, Invalid
 from podcast_feed.guard import check_url
+from podcast_feed.storage import Storage
 
 CHUNK_SIZE = 64 * 1024
+UPLOAD_KIND = "upload"
+# Enough for any file name, and the name is shown in the admin UI and kept in the database.
+MAX_UPLOAD_NAME = 200
 
 
 @dataclass(frozen=True)
@@ -165,3 +174,36 @@ def _checked(url: str) -> str:
         return check_url(url)
     except Invalid as exc:
         raise EpisodeFailure("blocked address") from exc
+
+
+def upload_ref(episode_id: str, filename: str | None) -> str:
+    """The source reference of an upload: `<episode id>/<file name>`, or the id alone when the
+    browser gave no usable name. The name is cleaned like a downloaded one (last path component,
+    no control characters) and cut. The id makes every upload its own episode."""
+    name = _basename(filename or "")
+    return f"{episode_id}/{name[:MAX_UPLOAD_NAME]}" if name else episode_id
+
+
+def upload_id(ref: str) -> str:
+    return ref.partition("/")[0]
+
+
+def upload_filename(ref: str) -> str | None:
+    return ref.partition("/")[2] or None
+
+
+class UploadSource:
+    """Hands the worker an upload: moves media/.tmp/<id>.upload to where the job wants it."""
+
+    kind = UPLOAD_KIND
+
+    def __init__(self, storage: Storage) -> None:
+        self._storage = storage
+
+    async def fetch(self, ref: str, dest: Path) -> Fetched:
+        try:
+            os.replace(self._storage.upload_ready(upload_id(ref)), dest)
+        except FileNotFoundError:
+            # A restart empties media/.tmp/ before the worker starts, and a queued upload with it.
+            raise EpisodeFailure("upload lost") from None
+        return Fetched(dest, upload_filename(ref), "upload")

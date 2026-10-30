@@ -195,11 +195,20 @@ def _on_signal(sig: signal.Signals, stop: asyncio.Event) -> None:
     stop.set()
 
 
-def main() -> None:
-    """Run podcast-feed until SIGTERM or SIGINT."""
+def configure_logging() -> None:
+    """INFO to stderr, without the libraries that would log what a caller sent."""
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
     # The SDK logs every request at INFO, and a failed tool call with its message.
     logging.getLogger("mcp").setLevel(logging.WARNING)
+    # httpx logs the URL of every request the worker makes, each redirect hop too, at INFO,
+    # and httpcore the host at DEBUG. A link can carry a private token, and no link is logged.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+
+
+def main() -> None:
+    """Run podcast-feed until SIGTERM or SIGINT."""
+    configure_logging()
     try:
         settings = Settings.from_env()
     except ConfigError as exc:

@@ -3,10 +3,13 @@
 #     scripts/smoke.sh IMAGE
 # The container runs as in production: read-only root, no capabilities, uid 65532, /data and
 # /media on tmpfs. Checked: the image's healthcheck, the MCP tools and their annotations, the
-# admin UI, a feed round trip, the public routes' answers, ffmpeg and ffprobe, a log without
-# the public base, and that `docker stop` (SIGTERM) ends the process by itself within 8 s.
+# admin UI and its static files, a feed round trip, the public routes' answers, ffmpeg and
+# ffprobe, a log without the public base, and that `docker stop` (SIGTERM) ends the process by
+# itself within 8 s.
 # The container is always removed; its log is printed when a check fails.
 set -euo pipefail
+# A "." in `time`'s seconds and plain-byte matching, whatever the caller's locale.
+export LC_ALL=C
 
 image=${1:?usage: scripts/smoke.sh IMAGE}
 name=podcast-feed-smoke
@@ -94,12 +97,17 @@ grep -qx 'no such feed' "$tmp/body" || fail "GET /feeds/nope.xml: unexpected bod
 expect 403 POST /feeds/smoke.xml
 expect 405 POST /feeds/smoke.xml -H 'Sec-Fetch-Site: same-origin'
 expect 303 GET /
+# The admin UI's static files come from the installed wheel.
+expect 200 GET /ui/static/htmx.min.js
+[[ $(head -n 1 "$tmp/body") == '/*'* ]] || fail "GET /ui/static/htmx.min.js: unexpected body"
 
 # SIGTERM: the process must stop by itself (exit status 0), well before Docker's 10 s
 # timeout would kill it (137).
 TIMEFORMAT=%R
 elapsed=$({ time docker stop "$name" >/dev/null; } 2>&1)
 echo "docker stop took ${elapsed} s"
+# Not a number would make awk compare strings, and pass.
+[[ $elapsed =~ ^[0-9]+\.[0-9]+$ ]] || fail "could not read the stop time: $elapsed"
 awk -v s="$elapsed" -v limit="$stop_limit_s" 'BEGIN { exit !(s < limit) }' ||
   fail "docker stop took ${elapsed} s (limit ${stop_limit_s} s)"
 code=$(docker inspect --format '{{.State.ExitCode}}' "$name")

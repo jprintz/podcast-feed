@@ -11,7 +11,8 @@ from starlette.testclient import TestClient
 from podcast_feed import main as main_module
 from podcast_feed.config import Settings
 from podcast_feed.db import Database
-from podcast_feed.main import build, main, serve
+from podcast_feed.guard import guarded_client
+from podcast_feed.main import build, configure_logging, main, serve
 from podcast_feed.worker import Worker
 from tests.conftest import wait_until_listening
 
@@ -264,19 +265,51 @@ async def test_an_open_download_does_not_hold_up_the_stop(tmp_path, free_port, m
 # ---------------------------------------------------------------------------------- main
 
 
+QUIETED = ("mcp", "httpx", "httpcore")
+
+
 @pytest.fixture
-def main_env(tmp_path, monkeypatch):
-    """The environment main() reads, and the mcp logger's level put back afterwards."""
+def library_log_levels():
+    """The levels configure_logging() sets on library loggers, put back afterwards."""
+    levels = {name: logging.getLogger(name).level for name in QUIETED}
+    yield
+    for name, level in levels.items():
+        logging.getLogger(name).setLevel(level)
+
+
+@pytest.fixture
+def main_env(tmp_path, monkeypatch, library_log_levels):
+    """The environment main() reads (and the library loggers' levels put back afterwards)."""
     for name, value in {
         "PODCAST_PUBLIC_BASE": PUBLIC_BASE,
         "PODCAST_DATA_DIR": str(tmp_path / "data"),
         "PODCAST_MEDIA_DIR": str(tmp_path / "media"),
     }.items():
         monkeypatch.setenv(name, value)
-    mcp_logger = logging.getLogger("mcp")
-    level = mcp_logger.level
-    yield
-    mcp_logger.setLevel(level)
+
+
+async def test_logging_keeps_request_lines_out(library_log_levels, local_http_server, caplog):
+    """httpx logs every request line at INFO, and httpcore the host at DEBUG. A link can carry
+    a private token, so with main()'s logging setup none of it reaches a log, not even with
+    the root logger at DEBUG."""
+    configure_logging()
+    caplog.set_level(logging.DEBUG)  # the root logger: stricter than main()'s INFO
+    for name in ("httpx", "httpcore"):
+        assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING, name
+    url = f"http://files.example:{local_http_server.port}/a.mp3?token=PRIVATE"
+
+    async def resolve(host: str, port: int) -> list[str]:
+        return ["127.0.0.1"]
+
+    # The worker's own client, with only the address check relaxed to reach the local server.
+    async with guarded_client(resolve=resolve, is_allowed=lambda ip: True) as client:
+        response = await client.get(url)
+    assert response.status_code == 200
+    assert local_http_server.last_host == f"files.example:{local_http_server.port}"
+    for record in caplog.records:
+        message = record.getMessage()
+        for leak in ("files.example", "a.mp3", "token", "PRIVATE"):
+            assert leak not in message, f"{record.name}: {message}"
 
 
 def test_main_refuses_a_bad_setting_without_quoting_it(main_env, monkeypatch, capsys):
@@ -312,16 +345,19 @@ def test_main_exits_1_when_a_part_stops_unexpectedly(main_env, monkeypatch, capl
     assert "worker stopped unexpectedly" in caplog.text
 
 
-def test_main_quiets_the_mcp_sdk_and_returns_after_a_clean_stop(main_env, monkeypatch):
+def test_main_quiets_the_libraries_and_returns_after_a_clean_stop(main_env, monkeypatch, caplog):
     seen = []
 
     async def quick_serve(settings, stop):
         seen.append(settings.public_base)
 
     monkeypatch.setattr(main_module, "serve", quick_serve)
+    # The root logger at DEBUG: only a level set on the library's own logger keeps it quiet.
+    caplog.set_level(logging.DEBUG)
     main()  # no SystemExit: exit status 0
     assert seen == [PUBLIC_BASE]
-    assert logging.getLogger("mcp").level == logging.WARNING
+    for name in QUIETED:
+        assert logging.getLogger(name).getEffectiveLevel() >= logging.WARNING, name
 
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT])

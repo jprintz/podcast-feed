@@ -21,6 +21,8 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v10.3.2
         with:
           python-version: "3.14"
@@ -46,7 +48,11 @@ jobs:
       contents: read
       packages: write
     steps:
+      # The token stays out of .git/config: the smoke test runs the branch's own script. The
+      # push logs in with docker/login-action instead.
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: docker/setup-buildx-action@v4
 
       - name: Build for the smoke test

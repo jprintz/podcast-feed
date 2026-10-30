@@ -9,6 +9,12 @@ Every path handed to ffmpeg or ffprobe is made absolute first, so a file name th
 ffmpeg never fetches a URL itself (the URL guard only sees our own download). Playlist formats
 (HLS, concat, DASH, SDP) are refused outright by `probe`: they name other files, and ffmpeg
 would read local ones, so the format check is what blocks local references.
+
+A downloaded file is untrusted, and its tags are what it can make big. ffprobe and ffmpeg run with
+`-max_alloc`, so a tag that claims to be hundreds of megabytes is skipped instead of read into
+memory, and ffprobe's output (it lists every tag; a few KiB for a normal file) is read as it comes
+and refused beyond 8 MiB. The service has a memory ceiling, and a job that gets itself killed is
+queued again by the restart.
 """
 
 import asyncio
@@ -29,7 +35,12 @@ CONVERT_TIMEOUT_S = 1800
 PROBE_TIMEOUT_S = 120
 COVER_TIMEOUT_S = 120
 AUDIO_BITRATE = "128k"
-
+# The largest single allocation ffprobe and ffmpeg may make; a bigger one fails, and the tag or
+# frame that asked for it is skipped ("Error reading comment frame, skipped").
+MAX_ALLOC_BYTES = 128 * 1024 * 1024
+# The most of ffprobe's output that is read; its JSON holds every tag of the file.
+MAX_OUTPUT_BYTES = 8 * 1024 * 1024
+_READ_SIZE = 64 * 1024
 _LOCAL_FILES_ONLY = ["-protocol_whitelist", "file"]
 # Formats whose files are lists of other files or streams; `format_name` can list several.
 _PLAYLIST_FORMATS = {"hls", "applehttp", "concat", "dash", "sdp"}
@@ -57,23 +68,53 @@ def _arg(path: Path) -> str:
     return str(path.absolute())
 
 
+def _alloc_cap() -> list[str]:
+    """The option that caps what ffprobe or ffmpeg may allocate at once."""
+    return ["-max_alloc", str(MAX_ALLOC_BYTES)]
+
+
+async def _read_all(stream: asyncio.StreamReader) -> bytes:
+    """Everything the stream gives, read as it comes; the file is not media if it is more than
+    MAX_OUTPUT_BYTES, and the rest is never read."""
+    chunks: list[bytes] = []
+    size = 0
+    while chunk := await stream.read(_READ_SIZE):
+        size += len(chunk)
+        if size > MAX_OUTPUT_BYTES:
+            raise EpisodeFailure(NOT_MEDIA)
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
 async def _run(argv: list[str], timeout_s: float, *, capture: bool = False) -> tuple[int, bytes]:
     """Run argv to the end; returns its exit code and (if capture) its output.
 
-    If it takes longer than timeout_s (TimeoutError) or this task is cancelled, the process is
-    killed and reaped before the exception goes on.
+    If it takes longer than timeout_s (TimeoutError), writes more than MAX_OUTPUT_BYTES of output
+    (EpisodeFailure: not media) or this task is cancelled, the process is killed and reaped before
+    the exception goes on.
     """
     proc = await asyncio.create_subprocess_exec(
         *argv, stdin=DEVNULL, stdout=PIPE if capture else DEVNULL, stderr=DEVNULL
     )
+
+    async def finish() -> bytes:
+        stdout = await _read_all(proc.stdout) if capture else b""
+        await proc.wait()
+        return stdout
+
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout_s)
+        stdout = await asyncio.wait_for(finish(), timeout_s)
     except BaseException:
         with contextlib.suppress(ProcessLookupError):
             proc.kill()
         await proc.wait()
+        if capture:
+            # A reader that stopped early has paused the pipe, which then never sees the end
+            # and stays open: what the dead process left in it is read (and dropped) to close it.
+            while await proc.stdout.read(_READ_SIZE):
+                pass
         raise
-    return proc.returncode, stdout or b""
+    return proc.returncode, stdout
 
 
 def _duration(fmt: dict) -> float | None:
@@ -86,7 +127,8 @@ def _duration(fmt: dict) -> float | None:
 
 async def probe(path: Path) -> Probe:
     """Inspect a file. Raises EpisodeFailure if it is not audio or video, or has no audio."""
-    argv = ["ffprobe", "-v", "error", "-print_format", "json", "-show_format", "-show_streams"]
+    argv = ["ffprobe", "-v", "error", *_alloc_cap()]
+    argv += ["-print_format", "json", "-show_format", "-show_streams"]
     try:
         code, out = await _run(
             [*argv, *_LOCAL_FILES_ONLY, "-i", _arg(path)], PROBE_TIMEOUT_S, capture=True
@@ -155,7 +197,8 @@ async def convert(
         os.replace(src, dest)
         return
     codec = ["-c:a", "copy"] if plan == "copy" else ["-c:a", "aac", "-b:a", AUDIO_BITRATE]
-    argv = ["ffmpeg", "-nostdin", "-v", "error", "-y", *_LOCAL_FILES_ONLY, "-i", _arg(src)]
+    argv = ["ffmpeg", "-nostdin", "-v", "error", "-y", *_alloc_cap()]
+    argv += [*_LOCAL_FILES_ONLY, "-i", _arg(src)]
     argv += ["-map", "0:a:0", "-vn", *codec, "-movflags", "+faststart", _arg(dest)]
     done = False
     try:
@@ -181,7 +224,8 @@ async def extract_cover(src: Path, dest_stem: Path, p: Probe) -> Path | None:
     if extension is None or not isinstance(p.cover_index, int):
         return None
     dest = dest_stem.with_name(dest_stem.name + extension)
-    argv = ["ffmpeg", "-nostdin", "-v", "error", "-y", *_LOCAL_FILES_ONLY, "-i", _arg(src)]
+    argv = ["ffmpeg", "-nostdin", "-v", "error", "-y", *_alloc_cap()]
+    argv += [*_LOCAL_FILES_ONLY, "-i", _arg(src)]
     argv += ["-map", f"0:{p.cover_index}", "-frames:v", "1", "-c:v", "copy", _arg(dest)]
     done = False
     try:

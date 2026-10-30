@@ -12,6 +12,7 @@ import pytest
 from podcast_feed import audio
 from podcast_feed.audio import Probe, convert, extract_cover, plan_output, probe
 from podcast_feed.errors import EpisodeFailure
+from tests.media import mp3_with_comment
 
 NOT_MEDIA = "not an audio or video file"
 
@@ -336,3 +337,80 @@ async def test_names_starting_with_a_dash_are_not_options(media, tmp_path, monke
     assert cover is not None and cover.read_bytes().startswith(b"\x89PNG")
     await convert(Path("-c.mp3"), Path("-kept.mp3"), "keep")
     assert (tmp_path / "-kept.mp3").exists()
+
+
+# ------------------------------------------------- what a file's metadata can cost
+
+
+MIB = 1024 * 1024
+STREAM_JSON = '{"codec_type": "audio", "codec_name": "mp3", "disposition": {"attached_pic": 0}}'
+PROBE_JSON = '{"format": {"format_name": "mp3", "duration": "2"}, "streams": [' + STREAM_JSON + "]}"
+
+
+async def test_a_tag_that_makes_ffprobes_output_huge_is_not_media(ffmpeg_tools, tmp_path):
+    # ffprobe prints every tag, so a 9 MiB comment is 9 MiB of JSON that would all be held in
+    # memory (and then in the database and the feed).
+    src = mp3_with_comment(tmp_path, 9 * MIB)
+    try:
+        with pytest.raises(EpisodeFailure, match=f"^{NOT_MEDIA}$"):
+            await probe(src)
+    finally:
+        src.unlink()
+
+
+@pytest.mark.parametrize("extra,ok", [(0, True), (1, False)])
+async def test_ffprobes_output_may_be_8_mib_but_not_a_byte_more(fake_tool, tmp_path, extra, ok):
+    padding = 8 * MIB - len(PROBE_JSON) + extra  # trailing white space is valid JSON
+    fake_tool("ffprobe", f"printf '%s' '{PROBE_JSON}'; head -c {padding} /dev/zero | tr '\\0' ' '")
+    if ok:
+        assert (await probe(tmp_path / "anything")).audio_codec == "mp3"
+    else:
+        with pytest.raises(EpisodeFailure, match=f"^{NOT_MEDIA}$"):
+            await probe(tmp_path / "anything")
+
+
+async def test_output_past_the_limit_kills_ffprobe_at_once(fake_tool, tmp_path, monkeypatch):
+    # The fake writes 20 MB and then hangs: nothing but the limit can end this before the timeout.
+    monkeypatch.setattr(audio, "PROBE_TIMEOUT_S", 60)
+    monkeypatch.setenv("PIDFILE", str(tmp_path / "pid"))
+    fake_tool("ffprobe", 'echo $$ > "$PIDFILE"; head -c 20000000 /dev/zero; exec sleep 60')
+    started = time.monotonic()
+    with pytest.raises(EpisodeFailure, match=f"^{NOT_MEDIA}$"):
+        await probe(tmp_path / "anything")
+    assert time.monotonic() - started < FAST
+    assert_gone(int((tmp_path / "pid").read_text()))
+
+
+async def test_every_ffprobe_and_ffmpeg_run_caps_allocations(fake_tool, tmp_path, monkeypatch):
+    monkeypatch.setenv("ARGV_FILE", str(tmp_path / "argv"))
+    record = 'echo "${0##*/} $*" >> "$ARGV_FILE"'
+    fake_tool("ffprobe", f"{record}; printf '%s' '{PROBE_JSON}'")
+    fake_tool("ffmpeg", f'{record}; for out; do :; done; echo x > "$out"')
+    src = tmp_path / "in.mp3"
+    info = await probe(src)
+    await convert(src, tmp_path / "copy.m4a", "copy")
+    await convert(src, tmp_path / "transcode.m4a", "transcode")
+    with_cover = dataclasses.replace(info, cover_codec="png", cover_index=1)
+    assert await extract_cover(src, tmp_path / "ep", with_cover) == tmp_path / "ep.png"
+    runs = (tmp_path / "argv").read_text().splitlines()
+    assert [run.split()[0] for run in runs] == ["ffprobe", "ffmpeg", "ffmpeg", "ffmpeg"]
+    for run in runs:
+        assert " -max_alloc 134217728 " in run, run
+
+
+async def test_the_allocation_cap_makes_the_tools_skip_a_huge_tag(
+    ffmpeg_tools, tmp_path, monkeypatch
+):
+    # A frame bigger than the cap is skipped ("Error reading comment frame, skipped") instead of
+    # being read into memory, by ffprobe and by ffmpeg, which would copy it into its output.
+    # The cap is lowered to 1 MiB here, so that the test file need not be 160 MB.
+    src = mp3_with_comment(tmp_path, 3 * MIB)
+    try:
+        assert len((await probe(src)).tags["comment"]) == 3 * MIB  # no cap that matters
+        monkeypatch.setattr(audio, "MAX_ALLOC_BYTES", MIB)
+        info = await probe(src)
+        assert info.audio_codec == "mp3" and "comment" not in info.tags
+        await convert(src, tmp_path / "out.m4a", "transcode")
+        assert "comment" not in (await probe(tmp_path / "out.m4a")).tags
+    finally:
+        src.unlink()

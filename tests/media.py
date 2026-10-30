@@ -75,3 +75,23 @@ def make_media(tmp_path: Path, kind: str) -> Path:
     path = tmp_path / name
     _ffmpeg(*args, str(path))
     return path
+
+
+def _syncsafe(number: int) -> bytes:
+    """An ID3v2 size: four bytes of seven bits each."""
+    return bytes([(number >> shift) & 0x7F for shift in (21, 14, 7, 0)])
+
+
+def mp3_with_comment(tmp_path: Path, size: int) -> Path:
+    """An MP3 file whose ID3v2.4 tag holds one comment (COMM) frame of `size` bytes of text, in
+    front of the audio of the `mp3` kind. Written by hand, so a test can have a tag far bigger
+    than any real one without ffmpeg making it; the file is as big as the tag, so delete it."""
+    audio = make_media(tmp_path, "mp3").read_bytes()
+    if audio.startswith(b"ID3"):  # ffmpeg wrote a tag of its own: replace it
+        tag_size = sum((audio[6 + i] & 0x7F) << (7 * (3 - i)) for i in range(4))
+        audio = audio[10 + tag_size :]
+    body = b"\x00eng\x00" + b"A" * size  # Latin-1 text, language, an empty description
+    frame = b"COMM" + _syncsafe(len(body)) + b"\x00\x00" + body
+    path = tmp_path / "comment.mp3"
+    path.write_bytes(b"ID3\x04\x00\x00" + _syncsafe(len(frame)) + frame + audio)
+    return path

@@ -29,6 +29,19 @@
     <input type="text" id="episode-title" name="title" value="{{ add.title or '' }}">
     <p><button type="submit">Add episode</button></p>
   </form>
+
+  {# Sent by the page's script (the file is the request body), so without script it stays hidden. #}
+  <div id="upload-section" hidden>
+    <h3>Upload a file</h3>
+    <form id="upload" data-action="/ui/feeds/{{ feed.slug }}/upload" data-max-bytes="{{ max_upload_bytes }}" data-too-large="{{ upload_too_large }}">
+      <label for="upload-file">Audio or video file, up to {{ max_upload_mb }} MB</label>
+      <input type="file" id="upload-file" name="file" accept="audio/*,video/*" required>
+      <label for="upload-title">Title (optional: taken from the file)</label>
+      <input type="text" id="upload-title" name="title">
+      <progress id="upload-progress" max="1" value="0" hidden></progress>
+      <p><button type="submit">Upload episode</button></p>
+    </form>
+  </div>
 </section>
 
 <section>

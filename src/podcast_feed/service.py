@@ -54,6 +54,7 @@ UPLOAD_TOO_LARGE = f"That file is over the {MAX_UPLOAD_MB} MB upload limit. Add 
 NO_UPLOAD = "No file was sent."
 UPLOAD_DISK = "The server is nearly out of disk space, so it cannot take the upload now."
 UPLOAD_NO_RETRY = "An upload can't be retried; upload the file again."
+UPLOAD_NOT_SAVED = "The server could not save the upload."
 
 STATUSES = ("queued", "downloading", "converting", "ready", "failed")
 # The kind of a link to a file the worker downloads; the other kind is an upload (sources).
@@ -81,6 +82,7 @@ class PendingUpload:
     feed_slug: str
     filename: str | None
     part: Path
+    limit: int  # the most bytes `part` may hold
 
 
 @dataclass(frozen=True)
@@ -379,7 +381,12 @@ class Service:
             raise Invalid(UPLOAD_DISK)
         episode_id = new_episode_id()
         return PendingUpload(
-            episode_id, target.id, target.slug, filename, self._storage.upload_part(episode_id)
+            episode_id,
+            target.id,
+            target.slug,
+            filename,
+            self._storage.upload_part(episode_id),
+            MAX_UPLOAD_BYTES,
         )
 
     def finish_upload(
@@ -393,7 +400,7 @@ class Service:
             size = upload.part.stat().st_size
             if size == 0:
                 raise Invalid(NO_UPLOAD)
-            if size > MAX_UPLOAD_BYTES:
+            if size > upload.limit:
                 raise TooLarge(UPLOAD_TOO_LARGE)
             # Complete: the name the worker looks for. Only now can it take the file.
             os.replace(upload.part, self._storage.upload_ready(upload.id))

@@ -1,8 +1,11 @@
 """The admin UI, under /ui/: where feeds are made, the secret feed address is shown, and episodes
-are added, edited, retried and removed.
+are added (by link, or by uploading a file), edited, retried and removed.
 
 It is plain HTML forms and server-rendered pages; htmx only refreshes the episode table while an
-episode is still being fetched. Cloudflare Access decides who gets in, and `SameOriginMiddleware`
+episode is still being fetched. The one thing a form cannot do is the file upload: the page's
+script sends the file as the body of a request, which `upload_episode` writes to disk as it
+arrives (a multipart form would be spooled by Starlette first, into the RAM-backed /tmp of a
+read-only container). Cloudflare Access decides who gets in, and `SameOriginMiddleware`
 makes sure a page on another site cannot make the browser of someone who is signed in post to it.
 
 Starlette runs a sync endpoint in its thread pool, but these handlers read forms, which is async,
@@ -19,14 +22,15 @@ links back to the list (status 404).
 """
 
 import asyncio
+import logging
 from collections.abc import Callable
 from importlib import resources
 from pathlib import Path
 from typing import Any
-from urllib.parse import quote, urlsplit
+from urllib.parse import quote, unquote, urlsplit
 
 from starlette.datastructures import Headers, UploadFile
-from starlette.requests import Request
+from starlette.requests import ClientDisconnect, Request
 from starlette.responses import PlainTextResponse, RedirectResponse, Response
 from starlette.routing import Route
 from starlette.templating import Jinja2Templates
@@ -34,8 +38,20 @@ from starlette.types import ASGIApp, Receive, Scope, Send
 
 from podcast_feed.config import MAX_RETENTION_DAYS
 from podcast_feed.db import Episode
-from podcast_feed.errors import Invalid, NotFound
-from podcast_feed.service import BAD_RETENTION, MAX_ARTWORK_BYTES, Service
+from podcast_feed.errors import Invalid, NotFound, TooLarge
+from podcast_feed.service import (
+    BAD_RETENTION,
+    MAX_ARTWORK_BYTES,
+    MAX_UPLOAD_BYTES,
+    MAX_UPLOAD_MB,
+    UPLOAD_NOT_SAVED,
+    UPLOAD_TOO_LARGE,
+    PendingUpload,
+    Service,
+)
+from podcast_feed.sources import UPLOAD_KIND, upload_filename
+
+log = logging.getLogger(__name__)
 
 # Found through importlib.resources: the image installs the package, so there is no source tree.
 TEMPLATES_DIR = Path(str(resources.files("podcast_feed") / "templates"))
@@ -111,8 +127,11 @@ class SameOriginMiddleware:
 
 
 def _source_host(episode: Episode) -> str:
-    """Where an episode comes from, for a row without a title. Only the host: the link itself
-    can be long and carries the file's address, which the pages never show."""
+    """Where an episode comes from, for a row without a title: the file name of an upload
+    ("upload" when the browser gave none), else only the host of its link: the link itself can
+    be long and carries the file's address, which the pages never show."""
+    if episode.source_kind == UPLOAD_KIND:
+        return upload_filename(episode.source_ref) or "upload"
     try:
         host = urlsplit(episode.source_ref).hostname
     except ValueError:
@@ -174,6 +193,33 @@ async def _fields_and_artwork(request: Request) -> tuple[dict[str, str], bytes]:
     return fields, data
 
 
+def _header_text(request: Request, name: str) -> str | None:
+    """A text the page's script put in a header, percent-encoded (a header holds no more than
+    Latin-1, and the script cannot send a file name any other way). In headers, not in the
+    address: request lines are logged, and the name of someone's file is not for the log."""
+    value = request.headers.get(name)
+    return None if value is None else unquote(value)
+
+
+def _declared_size(request: Request) -> int | None:
+    try:
+        return int(request.headers["content-length"])
+    except (KeyError, ValueError):
+        return None  # chunked, or nonsense: the bytes are counted as they arrive
+
+
+async def _receive(request: Request, upload: PendingUpload) -> None:
+    """Write the request body to the upload's part file, never holding more than a chunk in
+    memory. TooLarge once more than `upload.limit` bytes have come, whatever Content-Length said."""
+    written = 0
+    with upload.part.open("wb") as part:
+        async for chunk in request.stream():
+            written += len(chunk)
+            if written > upload.limit:
+                raise TooLarge(UPLOAD_TOO_LARGE)
+            part.write(chunk)
+
+
 # ------------------------------------------------------------------------ what a page shows
 
 
@@ -195,6 +241,11 @@ def _feed_context(service: Service, slug: str) -> dict[str, Any]:
     context["retention_days"] = next(
         (s.retention_days for s in service.list_feeds() if s.feed.id == context["feed"].id), None
     )
+    context |= {
+        "max_upload_bytes": MAX_UPLOAD_BYTES,
+        "max_upload_mb": MAX_UPLOAD_MB,
+        "upload_too_large": UPLOAD_TOO_LARGE,
+    }
     return context
 
 
@@ -354,6 +405,40 @@ def admin_routes(service: Service) -> list[Route]:
             return not_found(request, exc)
         return _redirect(_feed_location(slug))
 
+    async def upload_episode(request: Request) -> Response:
+        """The file is the request body; its name and an optional title are in `X-Upload-Name`
+        and `X-Upload-Title`. Answers 204, or the reason as plain text (the script shows it)."""
+        slug = request.path_params["slug"]
+
+        def refused(reason: object, status: int) -> Response:
+            return PlainTextResponse(str(reason), status_code=status, headers=PAGE_HEADERS)
+
+        name = _header_text(request, "x-upload-name")
+        try:
+            pending = await asyncio.to_thread(
+                service.start_upload, slug, name, _declared_size(request)
+            )
+            try:
+                await _receive(request, pending)
+            except BaseException:  # a body that stopped, was too big, or could not be written
+                service.abort_upload(pending)  # an unlink: cheap, and cancellation must not skip it
+                raise
+            await asyncio.to_thread(
+                service.finish_upload, pending, _header_text(request, "x-upload-title")
+            )
+        except TooLarge as exc:
+            return refused(exc, 413)
+        except Invalid as exc:
+            return refused(exc, 400)
+        except NotFound as exc:
+            return refused(exc, 404)
+        except ClientDisconnect:  # nobody is left to answer
+            return PlainTextResponse("", status_code=400, headers=PAGE_HEADERS)
+        except OSError:  # the disk: a full one, a failing one
+            log.exception("An upload could not be saved")  # the id is in the path, never the name
+            return refused(UPLOAD_NOT_SAVED, 500)
+        return Response(status_code=204, headers=PAGE_HEADERS)
+
     async def on_episode(
         request: Request, action: Callable[..., object], *args: str | None
     ) -> Response:
@@ -387,6 +472,7 @@ def admin_routes(service: Service) -> list[Route]:
         Route("/ui/feeds/{slug}", feed, methods=["GET"]),
         Route("/ui/feeds/{slug}/episodes", episodes, methods=["GET"]),
         Route("/ui/feeds/{slug}/episodes", add_episode, methods=["POST"]),
+        Route("/ui/feeds/{slug}/upload", upload_episode, methods=["POST"]),
         Route("/ui/feeds/{slug}/settings", settings, methods=["POST"]),
         Route("/ui/feeds/{slug}/artwork", artwork, methods=["POST"]),
         Route("/ui/feeds/{slug}/default", make_default, methods=["POST"]),

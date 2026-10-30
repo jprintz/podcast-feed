@@ -9,8 +9,8 @@ import pytest
 
 from podcast_feed.config import GIB, Settings
 from podcast_feed.db import Database, Episode
-from podcast_feed.errors import Invalid, NotFound
-from podcast_feed.service import FeedSummary, Service
+from podcast_feed.errors import Invalid, NotFound, TooLarge
+from podcast_feed.service import MAX_UPLOAD_BYTES, FeedSummary, Service
 from podcast_feed.storage import Storage
 
 URL = "https://x.example/a.mp3"
@@ -1041,3 +1041,139 @@ def test_the_public_methods_never_leak_the_secret_in_errors(svc):
         with pytest.raises(NotFound) as exc:
             call()
         assert "s3cr3t" not in str(exc.value)
+
+
+# ------------------------------------------------------------------------------- uploads
+
+
+def receive(svc, body=b"audio", filename="talk.mp3", feed=None, declared=None):
+    """What the admin UI does with an upload: start, write the body, finish."""
+    pending = svc.start_upload(feed, filename, len(body) if declared is None else declared)
+    pending.part.write_bytes(body)
+    return pending
+
+
+def tmp_files(storage) -> list[str]:
+    return sorted(p.name for p in storage.tmp.iterdir())
+
+
+def test_an_upload_is_queued_under_its_own_id(svc, storage, wakes):
+    svc.create_feed("Talks")
+    pending = receive(svc, filename="C:\\Music\\Talk One.mp3")
+    assert tmp_files(storage) == [f"{pending.id}.part"] and wakes == []  # not yet an episode
+    e = svc.finish_upload(pending, "  Mine ", "About it")
+    assert e.id == pending.id and (e.status, e.source_kind) == ("queued", "upload")
+    assert e.source_ref == f"{pending.id}/Talk One.mp3"
+    assert (e.title, e.description, e.feed_slug) == ("Mine", "About it", "talks")
+    assert tmp_files(storage) == [f"{pending.id}.upload"] and wakes == [None]
+    assert storage.upload_ready(pending.id).read_bytes() == b"audio"
+    assert svc.get_episode(e.id) == e
+
+
+def test_the_same_file_uploaded_twice_is_two_episodes(svc, wakes):
+    svc.create_feed("Talks")
+    a = svc.finish_upload(receive(svc))
+    b = svc.finish_upload(receive(svc))
+    assert a.id != b.id and len(svc.list_episodes()) == 2 and wakes == [None, None]
+
+
+def test_an_upload_goes_to_the_named_feed_or_the_default(svc):
+    svc.create_feed("Talks")
+    svc.create_feed("B")
+    assert svc.finish_upload(receive(svc)).feed_slug == "talks"
+    assert svc.finish_upload(receive(svc, feed="b")).feed_slug == "b"
+
+
+def test_an_upload_needs_a_feed(svc, storage):
+    with pytest.raises(Invalid, match="No feeds yet"):
+        svc.start_upload(None, "a.mp3", 5)
+    svc.create_feed("Talks")
+    with pytest.raises(NotFound, match="Unknown feed 'nope'"):
+        svc.start_upload("nope", "a.mp3", 5)
+    assert tmp_files(storage) == []
+
+
+def test_a_declared_size_over_the_limit_is_refused_before_anything_is_written(svc, storage):
+    svc.create_feed("Talks")
+    with pytest.raises(TooLarge) as exc:
+        svc.start_upload(None, "a.mp3", MAX_UPLOAD_BYTES + 1)
+    assert str(exc.value) == "That file is over the 100 MB upload limit. Add it by link instead."
+    assert tmp_files(storage) == []
+    svc.start_upload(None, "a.mp3", MAX_UPLOAD_BYTES)  # exactly the limit fits
+    svc.start_upload(None, "a.mp3", None)  # no Content-Length: counted while it arrives
+
+
+def test_an_upload_is_refused_when_the_disk_would_fall_below_the_floor(svc, storage, monkeypatch):
+    svc.create_feed("Talks")
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + 1000 - 1)
+    with pytest.raises(Invalid) as exc:
+        svc.start_upload(None, "a.mp3", 1000)
+    assert (
+        str(exc.value)
+        == "The server is nearly out of disk space, so it cannot take the upload now."
+    )
+    monkeypatch.setattr(storage, "free_bytes", lambda: 5 * GIB + 1000)
+    svc.start_upload(None, "a.mp3", 1000)
+
+
+def test_an_empty_upload_is_refused_and_leaves_nothing(svc, storage, wakes):
+    svc.create_feed("Talks")
+    with pytest.raises(Invalid) as exc:
+        svc.finish_upload(receive(svc, body=b""))
+    assert str(exc.value) == "No file was sent."
+    assert tmp_files(storage) == [] and svc.list_episodes() == [] and wakes == []
+
+
+def test_an_upload_that_grew_past_the_limit_is_refused_and_leaves_nothing(svc, storage, wakes):
+    svc.create_feed("Talks")
+    pending = svc.start_upload(None, "a.mp3", None)
+    with pending.part.open("wb") as part:
+        part.truncate(MAX_UPLOAD_BYTES + 1)  # a sparse file: no 100 MB written
+    with pytest.raises(TooLarge):
+        svc.finish_upload(pending)
+    assert tmp_files(storage) == [] and svc.list_episodes() == [] and wakes == []
+
+
+def test_an_upload_whose_feed_was_deleted_meanwhile_leaves_nothing(svc, storage, wakes):
+    svc.create_feed("Talks")
+    svc.create_feed("B")
+    pending = receive(svc, feed="b")
+    svc.delete_feed("b")
+    with pytest.raises(NotFound, match="Unknown feed 'b'"):
+        svc.finish_upload(pending)
+    assert tmp_files(storage) == [] and wakes == []
+
+
+def test_an_aborted_upload_leaves_nothing(svc, storage):
+    svc.create_feed("Talks")
+    svc.abort_upload(receive(svc))
+    assert tmp_files(storage) == []
+    svc.abort_upload(receive(svc))  # nothing to clean up twice
+
+
+def test_a_failed_upload_cannot_be_retried(svc, db, storage, wakes):
+    svc.create_feed("Talks")
+    e = svc.finish_upload(receive(svc))
+    wakes.clear()
+    with pytest.raises(Invalid, match="Only failed"):  # not failed yet
+        svc.retry_episode(e.id)
+    db.set_status(e.id, "failed", "upload lost")
+    with pytest.raises(Invalid) as exc:
+        svc.retry_episode(e.id)
+    assert str(exc.value) == "An upload can't be retried; upload the file again."
+    assert svc.get_episode(e.id).status == "failed" and wakes == []
+
+
+def test_removing_an_upload_that_waits_takes_its_file(svc, storage):
+    svc.create_feed("Talks")
+    e = svc.finish_upload(receive(svc))
+    svc.remove_episode(e.id)
+    assert tmp_files(storage) == [] and svc.list_episodes() == []
+
+
+def test_removing_an_episode_leaves_the_files_of_other_uploads(svc, storage):
+    svc.create_feed("Talks")
+    keep = svc.finish_upload(receive(svc))
+    gone = svc.finish_upload(receive(svc))
+    svc.remove_episode(gone.id)
+    assert tmp_files(storage) == [f"{keep.id}.upload"]

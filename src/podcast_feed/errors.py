@@ -13,6 +13,10 @@ class Invalid(PodcastError):
     """The caller asked for something that is not acceptable (a bad link, name or value)."""
 
 
+class TooLarge(Invalid):
+    """An upload is over the size limit (a kind of Invalid that the web app answers with 413)."""
+
+
 class NotFound(PodcastError):
     """The feed or episode that was asked for does not exist."""
 

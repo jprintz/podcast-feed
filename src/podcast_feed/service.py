@@ -28,12 +28,13 @@ from datetime import datetime
 from pathlib import Path
 
 from podcast_feed.config import MAX_RETENTION_DAYS, Settings
-from podcast_feed.db import Database, Episode, Feed
-from podcast_feed.errors import Invalid, NotFound
+from podcast_feed.db import Database, Episode, Feed, new_episode_id
+from podcast_feed.errors import Invalid, NotFound, TooLarge
 from podcast_feed.guard import check_url
 from podcast_feed.metadata import DESCRIPTION_MAX, TITLE_MAX
 from podcast_feed.rss import render_feed
 from podcast_feed.slug import slugify, valid_slug
+from podcast_feed.sources import UPLOAD_KIND, upload_ref
 from podcast_feed.storage import Storage
 
 NO_FEEDS = "No feeds yet: create one in the podcast admin UI first."
@@ -45,8 +46,17 @@ BAD_ARTWORK = "Artwork must be a PNG or JPEG under 5 MB."
 ONLY_FAILED = "Only failed episodes can be retried."
 BAD_LIMIT = "The limit must be at least 1."
 
+# Cloudflare refuses a request body over 100 MB on the free plan, so a bigger file could not
+# arrive through the tunnel anyway; the limit says so before the upload starts.
+MAX_UPLOAD_MB = 100
+MAX_UPLOAD_BYTES = MAX_UPLOAD_MB * 1024 * 1024
+UPLOAD_TOO_LARGE = f"That file is over the {MAX_UPLOAD_MB} MB upload limit. Add it by link instead."
+NO_UPLOAD = "No file was sent."
+UPLOAD_DISK = "The server is nearly out of disk space, so it cannot take the upload now."
+UPLOAD_NO_RETRY = "An upload can't be retried; upload the file again."
+
 STATUSES = ("queued", "downloading", "converting", "ready", "failed")
-# The only kind of source there is: a link to a file the worker downloads.
+# The kind of a link to a file the worker downloads; the other kind is an upload (sources).
 SOURCE_KIND = "url"
 
 MAX_ARTWORK_BYTES = 5 * 1024 * 1024
@@ -57,6 +67,20 @@ _ARTWORK_TYPES = {"png": "image/png", "jpg": "image/jpeg"}
 # A Python str holds a surrogate only when it is unpaired (JSON can carry one, as \ud800), and
 # SQLite cannot store it.
 _SURROGATES = re.compile(r"[\ud800-\udfff]")
+
+
+@dataclass(frozen=True)
+class PendingUpload:
+    """An upload that is being received: the file goes to `part`, then finish_upload queues it.
+
+    Its id becomes the episode's id, and the files in media/.tmp/ are named after it.
+    """
+
+    id: str
+    feed_id: int
+    feed_slug: str
+    filename: str | None
+    part: Path
 
 
 @dataclass(frozen=True)
@@ -315,7 +339,11 @@ class Service:
             return self._db.update_episode_text(id, title, description)
 
     def retry_episode(self, id: str) -> Episode:
-        """Queue a failed episode again; any other is Invalid."""
+        """Queue a failed episode again; any other is Invalid. An upload cannot be queued again:
+        its file is deleted when the job ends."""
+        current = self.get_episode(id)
+        if current.status == "failed" and current.source_kind == UPLOAD_KIND:
+            raise Invalid(UPLOAD_NO_RETRY)
         episode, queued = self._requeue_if_failed(id)
         if not queued:
             raise Invalid(ONLY_FAILED)
@@ -330,6 +358,66 @@ class Service:
         self._db.delete_episode(id)
         self._storage.delete_episode_files(episode.feed_slug, episode)
         self._storage.delete_episode_files_by_id(episode.feed_slug, episode.id)
+        self._storage.delete_upload(episode.id)  # one that still waits for the worker
+
+    # ---------------------------------------------------------------------- uploads
+
+    def start_upload(
+        self, feed: str | None, filename: str | None, declared_size: int | None
+    ) -> PendingUpload:
+        """Check that an upload of `declared_size` bytes (None: not known) can be taken into the
+        feed (slug), or the default feed, and say where to write it.
+
+        Nothing is written yet. The caller writes the body to `part`, counting what arrives, and
+        then calls finish_upload, or abort_upload if the body did not arrive: until finish_upload
+        the worker cannot see the file.
+        """
+        target = self._feed_for_add(feed)
+        if declared_size is not None and declared_size > MAX_UPLOAD_BYTES:
+            raise TooLarge(UPLOAD_TOO_LARGE)
+        if self._storage.free_bytes() < self._settings.min_free_bytes + (declared_size or 0):
+            raise Invalid(UPLOAD_DISK)
+        episode_id = new_episode_id()
+        return PendingUpload(
+            episode_id, target.id, target.slug, filename, self._storage.upload_part(episode_id)
+        )
+
+    def finish_upload(
+        self, upload: PendingUpload, title: str | None = None, description: str | None = None
+    ) -> Episode:
+        """Queue the received file as an episode and wake the worker. The title and description
+        are cut as in add_episode. Whatever is wrong with the file (empty, over the limit), or
+        the feed (deleted meanwhile), leaves no file behind. Every upload is an episode of its
+        own, even of a file that was uploaded before."""
+        try:
+            size = upload.part.stat().st_size
+            if size == 0:
+                raise Invalid(NO_UPLOAD)
+            if size > MAX_UPLOAD_BYTES:
+                raise TooLarge(UPLOAD_TOO_LARGE)
+            # Complete: the name the worker looks for. Only now can it take the file.
+            os.replace(upload.part, self._storage.upload_ready(upload.id))
+            try:
+                episode, _ = self._db.add_or_get_episode(
+                    upload.feed_id,
+                    UPLOAD_KIND,
+                    upload_ref(upload.id, upload.filename),
+                    _episode_text(title, TITLE_MAX),
+                    _episode_text(description, DESCRIPTION_MAX),
+                    upload.id,
+                )
+            except sqlite3.IntegrityError:
+                # The feed was deleted after it was looked up: the episode has no feed to belong to.
+                raise _unknown_feed(upload.feed_slug) from None
+        except BaseException:
+            self._storage.delete_upload(upload.id)
+            raise
+        self._wake()
+        return episode
+
+    def abort_upload(self, upload: PendingUpload) -> None:
+        """Delete what was received of an upload that was not finished."""
+        self._storage.delete_upload(upload.id)
 
     # ---------------------------------------------------------------- public files
 

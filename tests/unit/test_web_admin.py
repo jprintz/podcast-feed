@@ -1049,7 +1049,8 @@ def test_an_upload_that_cannot_be_written_says_so_and_leaves_nothing(
 
 def test_the_page_offers_the_upload_only_to_a_script(client, talks):
     page = client.get("/ui/feeds/talks").text
-    assert re.search(r'<div id="upload-section" hidden>', page)  # a script unhides it
+    assert re.search(r'<div id="upload-section" hidden data-feed-url="/ui/feeds/talks">', page)
+    assert 'aria-label="Upload progress"' in page
     assert 'id="upload"' in page and 'data-action="/ui/feeds/talks/upload"' in page
     assert f'data-max-bytes="{MAX_UPLOAD_BYTES}"' in page
     assert f'data-too-large="{TOO_LARGE}"' in page

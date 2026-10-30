@@ -38,7 +38,8 @@ document.addEventListener("htmx:beforeSwap", (event) => {
 // there is no way to send it, so the section stays hidden until here.
 const uploadForm = document.getElementById("upload");
 if (uploadForm) {
-  document.getElementById("upload-section").hidden = false;
+  const section = document.getElementById("upload-section");
+  section.hidden = false;
   const progress = document.getElementById("upload-progress");
   const button = uploadForm.querySelector("button");
 
@@ -58,11 +59,15 @@ if (uploadForm) {
     try { return encodeURIComponent(text); } catch (error) { return ""; }  // a lone surrogate
   };
 
+  // Every way an upload can end without an episode ends here: a message, no bar, a usable button.
   const failed = (text) => {
     showError(text);
     progress.hidden = true;
     button.disabled = false;
   };
+  // No answer at all: the connection dropped, the request was aborted or timed out, or (Access
+  // having let the session expire) the request was sent to a sign-in page instead of the app.
+  const lost = () => failed("The upload did not go through. Reload the page and try again.");
 
   uploadForm.addEventListener("submit", (event) => {
     event.preventDefault();
@@ -83,7 +88,9 @@ if (uploadForm) {
     xhr.upload.onprogress = (e) => { if (e.lengthComputable) progress.value = e.loaded / e.total; };
     xhr.onload = () => {
       if (xhr.status === 204) {
-        location.reload();  // the new episode is in the table
+        // Go to the feed's page, not "reload": this page may be the answer to a form that was
+        // posted (a refused episode), and reloading it would send that form again.
+        location.assign(section.dataset.feedUrl);
         return;
       }
       // Our own refusals are plain text; anything else (Cloudflare's page for a body that is too big) is not.
@@ -92,11 +99,17 @@ if (uploadForm) {
       else if (xhr.status === 413) failed(uploadForm.dataset.tooLarge);
       else failed("The upload failed (HTTP " + xhr.status + ").");
     };
-    xhr.onerror = () => failed("The upload was interrupted. Try again.");
+    xhr.onerror = lost;
+    xhr.onabort = lost;
+    xhr.ontimeout = lost;
     document.getElementById("upload-error")?.remove();
     progress.value = 0;
     progress.hidden = false;
     button.disabled = true;
-    xhr.send(file);
+    try {
+      xhr.send(file);
+    } catch (error) {
+      lost();
+    }
   });
 }

@@ -128,8 +128,9 @@ make smoke    # builds the image and smoke-tests it with Docker, as CI does
 `make smoke` runs `scripts/smoke.sh`: the container read-only with no capabilities, the
 image's healthcheck, the MCP tools and their annotations (`scripts/smoke_mcp.py`), the admin UI,
 a feed round trip, an uploaded file that becomes an episode, the public routes' answers,
-ffmpeg, and `docker stop` under 8 s with exit status 0. CI runs the tests with `REQUIRE_FFMPEG=1` (the static ffmpeg of the image) and the
-same smoke test, and pushes the image from `main` and from `v*` tags.
+ffmpeg, and `docker stop` under 8 s with exit status 0. CI runs the tests with `REQUIRE_FFMPEG=1`
+(the static ffmpeg of the image) and the same smoke test, and pushes the image from `main` and
+from `v*` tags.
 
 ## License
 

@@ -57,5 +57,11 @@ def test_every_source_of_a_title_is_cut_to_300_characters():
     assert episode_title("a" * 299 + " b", {}, None, "x", D) == "a" * 299
 
 
-def test_the_description_is_not_cut():
-    assert episode_description("d" * 5000, {}) == "d" * 5000
+def test_every_source_of_a_description_is_cut_to_4000_characters():
+    assert episode_description("d" * 5000, {}) == "d" * 4000
+    assert episode_description(None, {"description": "t" * 5000}) == "t" * 4000
+    assert episode_description(None, {"comment": "c" * 100_000}) == "c" * 4000
+    assert episode_description("d" * 4000, {}) == "d" * 4000
+    # The text is stripped first, then cut, then stripped again: no space at either end.
+    assert episode_description("  " + "a" * 3999 + " b", {}) == "a" * 3999
+    assert episode_description(None, {"comment": " x" * 3000}) == "x " * 1999 + "x"

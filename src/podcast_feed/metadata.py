@@ -7,6 +7,9 @@ source.
 from datetime import date
 
 TITLE_MAX = 300
+# A file's comment tag can be megabytes long, and the text goes into the database, the admin
+# pages, the MCP results and every fetch of the feed.
+DESCRIPTION_MAX = 4000
 
 
 def _text(value: str | None) -> str | None:
@@ -34,8 +37,9 @@ def episode_title(
 
 
 def episode_description(given: str | None, tags: dict[str, str]) -> str | None:
-    """The description: given, else the file's description tag, else its comment tag, else None."""
+    """The description: given, else the file's description tag, else its comment tag, else None.
+    Never longer than 4000 characters."""
     for candidate in (given, tags.get("description"), tags.get("comment")):
         if text := _text(candidate):
-            return text
+            return text[:DESCRIPTION_MAX].rstrip()
     return None

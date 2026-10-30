@@ -435,6 +435,24 @@ async def test_blank_and_padded_status_mean_any_or_that_status(svc):
         assert got == []
 
 
+async def test_a_lone_surrogate_in_a_title_is_dropped_not_an_internal_error(svc):
+    svc.create_feed("Talks")
+    async with Client(create_mcp(svc)) as c:
+        added = data(
+            await c.call_tool(
+                "add_episode", {"url": URL, "title": "Ti\ud800tle", "description": "\udc80 Notes"}
+            )
+        )
+        assert (added["title"], added["description"]) == ("Title", "Notes")
+        long = data(
+            await c.call_tool(
+                "add_episode",
+                {"url": "https://x.example/b.mp3", "title": "t" * 400, "description": "d" * 5000},
+            )
+        )
+        assert (len(long["title"]), len(long["description"])) == (300, 4000)
+
+
 async def test_an_unexpected_error_is_just_an_internal_error_to_the_client(svc, monkeypatch):
     async with Client(create_mcp(svc)) as c:
 

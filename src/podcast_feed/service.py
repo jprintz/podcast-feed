@@ -18,6 +18,7 @@ and in the addresses inside `feed_document`'s feed, which is served to those who
 """
 
 import os
+import re
 import sqlite3
 import threading
 from collections.abc import Callable, Iterator
@@ -30,6 +31,7 @@ from podcast_feed.config import MAX_RETENTION_DAYS, Settings
 from podcast_feed.db import Database, Episode, Feed
 from podcast_feed.errors import Invalid, NotFound
 from podcast_feed.guard import check_url
+from podcast_feed.metadata import DESCRIPTION_MAX, TITLE_MAX
 from podcast_feed.rss import render_feed
 from podcast_feed.slug import slugify, valid_slug
 from podcast_feed.storage import Storage
@@ -52,6 +54,9 @@ MAX_ARTWORK_BYTES = 5 * 1024 * 1024
 _ARTWORK_MAGIC = ((b"\x89PNG\r\n\x1a\n", "png"), (b"\xff\xd8\xff", "jpg"))
 _ARTWORK_EXTENSIONS = ("png", "jpg")
 _ARTWORK_TYPES = {"png": "image/png", "jpg": "image/jpeg"}
+# A Python str holds a surrogate only when it is unpaired (JSON can carry one, as \ud800), and
+# SQLite cannot store it.
+_SURROGATES = re.compile(r"[\ud800-\udfff]")
 
 
 @dataclass(frozen=True)
@@ -94,9 +99,16 @@ def _episode_exists(id: str) -> Iterator[None]:
 
 
 def _clean(text: str | None) -> str | None:
-    """text without surrounding whitespace; None if nothing is left."""
-    text = (text or "").strip()
+    """text without lone surrogates and surrounding whitespace; None if nothing is left."""
+    text = _SURROGATES.sub("", text or "").strip()
     return text or None
+
+
+def _episode_text(text: str | None, limit: int) -> str | None:
+    """`_clean` text of at most `limit` characters, as the file's own tags are cut (see
+    metadata): so a title or description cannot be made huge from outside either."""
+    text = _clean(text)
+    return None if text is None else text[:limit].rstrip()
 
 
 def _feed_title(title: str) -> str:
@@ -248,17 +260,21 @@ class Service:
     ) -> Episode:
         """Queue the file at `url` in the feed (slug), or in the default feed.
 
-        Returns at once: the worker does the rest. title and description are stripped, and
-        blank ones count as none. The link is the episode's identity within a feed, so adding
-        it again gives the existing episode: one that failed is queued again, any other is
-        returned as it is, and title and description given the second time are ignored.
-        The worker is woken exactly when this call queued an episode.
+        Returns at once: the worker does the rest. title and description are stripped and cut
+        to 300 and 4000 characters, and blank ones count as none. The link is the episode's
+        identity within a feed, so adding it again gives the existing episode: one that failed
+        is queued again, any other is returned as it is, and title and description given the
+        second time are ignored. The worker is woken exactly when this call queued an episode.
         """
         link = check_url(url)
         target = self._feed_for_add(feed)
         try:
             episode, created = self._db.add_or_get_episode(
-                target.id, SOURCE_KIND, link, _clean(title), _clean(description)
+                target.id,
+                SOURCE_KIND,
+                link,
+                _episode_text(title, TITLE_MAX),
+                _episode_text(description, DESCRIPTION_MAX),
             )
         except sqlite3.IntegrityError:
             # The feed was deleted after it was looked up: the episode has no feed to belong to.
@@ -292,9 +308,11 @@ class Service:
         return episode
 
     def update_episode(self, id: str, title: str | None, description: str | None) -> Episode:
-        """Set the title and description; blank ones count as none."""
+        """Set the title and description (cut as in add_episode); blank ones count as none."""
+        title = _episode_text(title, TITLE_MAX)
+        description = _episode_text(description, DESCRIPTION_MAX)
         with _episode_exists(id):
-            return self._db.update_episode_text(id, _clean(title), _clean(description))
+            return self._db.update_episode_text(id, title, description)
 
     def retry_episode(self, id: str) -> Episode:
         """Queue a failed episode again; any other is Invalid."""

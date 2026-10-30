@@ -258,6 +258,39 @@ def test_episode_text_is_stripped_and_blank_means_none(svc):
     assert (c.title, c.description) == (None, None)
 
 
+def test_episode_text_is_cut_to_300_and_4000_characters(svc):
+    svc.create_feed("Talks")
+    long_title, long_text = "t" * 400, "d" * 5000
+    a = svc.add_episode(URL, title=long_title, description=long_text)
+    assert (a.title, a.description) == ("t" * 300, "d" * 4000)
+    # Exactly the limit is kept, and the cut is followed by a strip: no space at the end.
+    b = svc.add_episode("https://x.example/b.mp3", title="t" * 300, description="d" * 4000)
+    assert (b.title, b.description) == ("t" * 300, "d" * 4000)
+    c = svc.add_episode(
+        "https://x.example/c.mp3", title=" " + "t" * 299 + " u ", description="d" * 3999 + " e"
+    )
+    assert (c.title, c.description) == ("t" * 299, "d" * 3999)
+    # The same when the text is edited, and what is stored is the cut text.
+    edited = svc.update_episode(a.id, " " + "u" * 301, " " + "e" * 4001)
+    assert (edited.title, edited.description) == ("u" * 300, "e" * 4000)
+    assert svc.get_episode(a.id) == edited
+
+
+def test_lone_surrogates_are_dropped_from_text(svc):
+    # JSON can carry one (\ud800), and SQLite cannot store it: it used to be an internal error.
+    feed = svc.create_feed(" Ta\ud800lks\udfff ", description="\udc80 About")
+    assert (feed.title, feed.description) == ("Talks", "About")
+    a = svc.add_episode(URL, title="Ti\ud800tle", description="\udc80Text\udbff")
+    assert (a.title, a.description) == ("Title", "Text")
+    b = svc.add_episode("https://x.example/b.mp3", title="\ud800\udc00", description="\udfff")
+    assert (b.title, b.description) == (None, None)  # nothing but surrogates is blank
+    edited = svc.update_episode(a.id, "\ud800 New", "N\udc80ew")
+    assert (edited.title, edited.description) == ("New", "New")
+    assert svc.update_episode(a.id, "\udc80", "\udc80").title is None
+    with pytest.raises(Invalid, match="needs a title"):
+        svc.create_feed("\ud800")
+
+
 def test_the_feed_is_deleted_while_the_episode_is_added(svc, db, wakes, monkeypatch):
     svc.create_feed("Talks")
     real = db.add_or_get_episode

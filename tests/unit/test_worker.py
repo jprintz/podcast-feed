@@ -20,6 +20,7 @@ from podcast_feed.errors import EpisodeFailure
 from podcast_feed.sources import Fetched
 from podcast_feed.storage import Storage
 from podcast_feed.worker import Worker
+from tests.media import mp3_with_comment
 
 T0 = datetime(2026, 10, 29, 12, 0, 0, tzinfo=UTC)
 REF = "https://x.example/tone.mp3"
@@ -216,6 +217,26 @@ async def test_given_title_kept(w, media):
     await w.worker.process(e.id)
     r = w.db.get_episode(e.id)
     assert (r.status, r.title, r.description) == ("ready", "Mine", "About it")
+
+
+async def test_a_long_comment_tag_becomes_a_cut_description(w, ffmpeg_tools, tmp_path):
+    w.source.file = mp3_with_comment(tmp_path, 100_000)
+    e = add(w)
+    await w.worker.process(e.id)
+    r = w.db.get_episode(e.id)
+    assert (r.status, r.description) == ("ready", "A" * 4000)
+
+
+async def test_tags_too_big_to_read_fail_as_not_media(w, ffmpeg_tools, tmp_path):
+    w.source.file = mp3_with_comment(tmp_path, 9 * 1024 * 1024)
+    e = add(w)
+    try:
+        await w.worker.process(e.id)
+    finally:
+        w.source.file.unlink()
+    r = w.db.get_episode(e.id)
+    assert (r.status, r.error) == ("failed", "not an audio or video file")
+    assert feed_files(w) == [] and not any(w.storage.tmp.iterdir())
 
 
 async def test_title_edited_while_processing_is_kept(w, media):
